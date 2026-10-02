@@ -28,6 +28,11 @@ env var                    meaning                                        defaul
                            language evidence; aliases like ml work
 ``LAYA_MAX_LOADED``        checkpoints kept resident at once. Below what  2
                            routing can choose, one reloads per switch.
+``LAYA_IDLE_UNLOAD_SECONDS``  unload every resident checkpoint after this  0 (off)
+                           many seconds without a request; the next
+                           request rebuilds what it routes to. Frees RAM
+                           and GPU memory on a mostly idle machine at the
+                           price of one cold load per idle stretch.
 ``LAYA_API_KEY``           if set, require ``Authorization: Bearer <it>``  (none)
 ``LAYA_ROOT_PATH``         public URL prefix behind a reverse proxy        (none)
 ``LAYA_LOG_LEVEL``         uvicorn log level                              info
@@ -208,6 +213,26 @@ def _resolve_max_concurrent() -> int:
     except ValueError:
         return DEFAULT_MAX_CONCURRENT
     return n if n > 0 else DEFAULT_MAX_CONCURRENT
+
+
+def _resolve_idle_unload_seconds() -> float:
+    """Idle window before every resident checkpoint is unloaded, from LAYA_IDLE_UNLOAD_SECONDS.
+
+    0 (the default) disables the behaviour. A value that does not parse, or is not positive,
+    is logged and treated as 0 so a typo never turns a long-running deployment into one that
+    silently drops its checkpoints.
+    """
+    raw = os.environ.get("LAYA_IDLE_UNLOAD_SECONDS")
+    if not raw or not str(raw).strip():
+        return 0.0
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        _log.warning("invalid LAYA_IDLE_UNLOAD_SECONDS %r; idle unload disabled", raw)
+        return 0.0
+    if seconds <= 0:
+        return 0.0
+    return seconds
 
 
 def _resolve_max_token_budget() -> int:
@@ -768,11 +793,50 @@ def create_app(router: Optional[Any] = None):
     max_concurrent = _resolve_max_concurrent()
     admission: Optional[asyncio.Semaphore] = None
 
+    # Idle unload (#LAYA_IDLE_UNLOAD_SECONDS). `last_request` is the wall-clock time of the
+    # most recent inference request; the reaper below compares it against the window. The
+    # unload itself runs on `pool`, the single inference worker, so it can never interleave
+    # with a forward pass: whichever of the two is queued first finishes before the other
+    # starts. A request that arrives after the unload pays one cold `Router.load` for the
+    # checkpoint it routes to, exactly as `LAYA_PRELOAD=0` would, and everything is warm again.
+    idle_unload_seconds = _resolve_idle_unload_seconds()
+    last_request = time.monotonic()
+
+    def _mark_request() -> None:
+        nonlocal last_request
+        last_request = time.monotonic()
+
+    async def _idle_reaper() -> None:
+        # Poll at a fraction of the window so the unload lands within ~25% of the deadline
+        # without waking a sleeping machine every few milliseconds for a long window.
+        interval = max(0.05, min(idle_unload_seconds / 4.0, 5.0))
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(interval)
+            idle_for = time.monotonic() - last_request
+            if idle_for < idle_unload_seconds or not (router.loaded or []):
+                continue
+            if gate is not None and gate.locked():
+                continue  # a forward pass is running; it will reset the clock when it is done
+            try:
+                await loop.run_in_executor(pool, router.unload)
+                _log.info("idle for %.0fs: unloaded every checkpoint (LAYA_IDLE_UNLOAD_SECONDS=%g)",
+                          idle_for, idle_unload_seconds)
+            except Exception:  # noqa: BLE001 -- a failed unload must not kill the reaper
+                _log.exception("idle unload failed")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        reaper = asyncio.create_task(_idle_reaper()) if idle_unload_seconds > 0 else None
         try:
             yield
         finally:
+            if reaper is not None:
+                reaper.cancel()
+                try:
+                    await reaper
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             # TestClient, embedded ASGI apps, and process supervisors all need
             # the executor to drain when the app stops.
             pool.shutdown(wait=True, cancel_futures=True)
@@ -839,6 +903,11 @@ def create_app(router: Optional[Any] = None):
             agent = router_agent(router, name)
             fallbacks[name] = {"count": getattr(agent, "cpu_fallback_count", 0),
                                "last_reason": getattr(agent, "last_fallback_reason", None)}
+        # Only when idle unload is on, so an existing reader of /health sees no new key unless
+        # the operator asked for the behaviour that makes `loaded == []` a normal state.
+        idle = ({"idle_unload_seconds": idle_unload_seconds,
+                 "idle_seconds": round(time.monotonic() - last_request, 1)}
+                if idle_unload_seconds > 0 else {})
         return {
             "status": "ok",
             "loaded": router.loaded,
@@ -847,6 +916,7 @@ def create_app(router: Optional[Any] = None):
             "device_is_preference": actual is None,
             "checkpoint_devices": checkpoint_devices,
             "cpu_fallbacks": fallbacks,
+            **idle,
         }
 
     @asynccontextmanager
@@ -875,6 +945,7 @@ def create_app(router: Optional[Any] = None):
 
     async def _systemone_inner(request: Request):
         nonlocal gate
+        _mark_request()
         body = await _read_json_body(request)
         if not isinstance(body, dict) or "questions" not in body:
             raise HTTPException(status_code=400, detail="request body must be an object with a 'questions' field")
@@ -929,6 +1000,7 @@ def create_app(router: Optional[Any] = None):
                     result = await loop.run_in_executor(
                         pool, lambda: router.predict(state, questions, model=model))
                 infer_ms = (time.perf_counter() - t0) * 1000.0
+                _mark_request()
                 if _env_bool("LAYA_JEV_STRICT", False):
                     result = _project_jev_strict(result)
                 from fastapi.responses import JSONResponse
@@ -963,6 +1035,7 @@ def create_app(router: Optional[Any] = None):
             return await _systemone_batch_inner(request)
 
     async def _systemone_batch_inner(request: Request):
+        _mark_request()
         nonlocal gate
         body = await _read_json_body(request)
         if not isinstance(body, dict) or "questions" not in body or "states" not in body:

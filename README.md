@@ -662,7 +662,10 @@ language evidence falls back to, `english` by default; set it to `multilingual` 
 your traffic is not English), `LAYA_MAX_LOADED` (checkpoints resident at
 once, 2 by default; raise it to 3 when `LAYA_AUTO_TASK` makes a third one
 reachable on demand, or the server rebuilds one every time routing switches),
-and `LAYA_API_KEY` (when set, clients must
+`LAYA_IDLE_UNLOAD_SECONDS` (unload every resident checkpoint after that many
+seconds without a request and rebuild on the next one, so a server that sits
+idle for long stretches gives its RAM and GPU memory back; `0`, the default,
+keeps checkpoints resident forever), and `LAYA_API_KEY` (when set, clients must
 send `Authorization: Bearer <key>`). A client's `model` field is honoured when it
 names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`), otherwise
 the router auto-selects by script/language. The same body can also carry `task`,

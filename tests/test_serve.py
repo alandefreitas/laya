@@ -33,6 +33,7 @@ from laya.serve import (  # noqa: E402
     _env_bool,
     _LONE_SURROGATE_DETAIL,
     _resolve_max_token_budget,
+    _resolve_idle_unload_seconds,
     _resolve_max_loaded,
     _resolve_model,
     create_app,
@@ -2834,3 +2835,109 @@ def test_http_api_page_documents_the_gate_report_on_an_answer():
         assert set(answer) == discriminator | rows[answer["type"]] | rows["all"], (
             "the sample's %s answer says %s, its table row plus the shared row say %s" % (
                 qid, sorted(answer), sorted(discriminator | rows[answer["type"]] | rows["all"])))
+
+
+# ---------------------------------------------------------------------------
+# Idle unload (LAYA_IDLE_UNLOAD_SECONDS)
+# ---------------------------------------------------------------------------
+
+class IdleRouter(FakeRouter):
+    """A FakeRouter whose `loaded` list empties when `unload()` is called, like the real one."""
+
+    def __init__(self):
+        super().__init__()
+        self.loaded = ["english"]
+        self.unload_calls = 0
+
+    def unload(self, name=None):
+        self.unload_calls += 1
+        self.loaded = []
+
+    def predict(self, state, questions, model=None, **kwargs):
+        if not self.loaded:            # the real Router rebuilds lazily on the next request
+            self.loaded = ["english"]
+        return super().predict(state, questions, model=model)
+
+
+def _wait_for(predicate, timeout=3.0, step=0.02):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(step)
+    return predicate()
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 0.0), ("", 0.0), ("  ", 0.0), ("0", 0.0), ("-5", 0.0), ("abc", 0.0),
+    ("300", 300.0), (" 0.5 ", 0.5), ("1e2", 100.0),
+])
+def test_resolve_idle_unload_seconds(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", raw)
+    assert _resolve_idle_unload_seconds() == expected
+
+
+def test_idle_unload_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = IdleRouter()
+    with TestClient(create_app(router=fake)) as client:
+        assert client.post("/v1/systemone", json=REQ).status_code == 200
+        import time
+        time.sleep(0.3)
+        health = client.get("/health").json()
+    assert fake.unload_calls == 0
+    assert fake.loaded == ["english"]
+    assert "idle_unload_seconds" not in health
+
+
+def test_idle_unload_frees_checkpoints_and_the_next_request_reloads(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.2")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = IdleRouter()
+    with TestClient(create_app(router=fake)) as client:
+        health = client.get("/health").json()
+        assert health["idle_unload_seconds"] == 0.2
+        assert "idle_seconds" in health
+
+        assert client.post("/v1/systemone", json=REQ).status_code == 200
+        assert fake.loaded == ["english"]
+
+        # No request for longer than the window: the reaper unloads everything.
+        assert _wait_for(lambda: fake.unload_calls >= 1)
+        assert fake.loaded == []
+        assert client.get("/health").json()["loaded"] == []
+
+        # The next request simply works again (the real Router lazy-loads on predict).
+        assert client.post("/v1/systemone", json=REQ).status_code == 200
+        assert fake.loaded == ["english"]
+        assert len(fake.calls) == 2
+
+
+def test_idle_unload_does_not_fire_while_requests_keep_coming(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.3")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = IdleRouter()
+    import time
+    with TestClient(create_app(router=fake)) as client:
+        t_end = time.monotonic() + 0.9
+        while time.monotonic() < t_end:   # requests every 0.1s, well inside the 0.3s window
+            assert client.post("/v1/systemone", json=REQ).status_code == 200
+            time.sleep(0.1)
+        assert fake.unload_calls == 0
+        assert fake.loaded == ["english"]
+
+
+def test_idle_unload_skips_a_router_with_nothing_loaded(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.1")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = IdleRouter()
+    fake.loaded = []
+    import time
+    with TestClient(create_app(router=fake)):
+        time.sleep(0.4)
+    assert fake.unload_calls == 0
