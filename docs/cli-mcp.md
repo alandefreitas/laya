@@ -229,12 +229,31 @@ the server is ready.
 | `LAYA_THREADS` | PyTorch default | Caps Torch intra-op threads for CPU inference; keep it at or below the physical core count. |
 | `LAYA_AUTO_TASK` | `0` | Set to `1` to let a request auto-route to the `typed-decisions` checkpoint. Same meaning as in `laya.serve`; it does not preload that checkpoint, so `LAYA_MODELS` still decides what is built at startup. |
 | `LAYA_DEFAULT_MODEL` | `english` | The checkpoint a state with no language evidence falls back to, same meaning as in `laya.serve`. Unlike `laya.serve`, an unresolvable name does not stop the server: it comes back as a `router construction failed` tool error on the next call, because a stdio server has no startup to refuse. |
+| `LAYA_BASE_URL` | unset | Remote mode. The origin of a running `laya-serve` (`http://127.0.0.1:8000`). When set, no checkpoint is built in the MCP process and no torch is imported: `laya_predict`, `laya_predict_batch`, `laya_decide` and `laya_preset` become `POST /v1/systemone` calls to that server, `laya_status` reports its `/health`, and routing tools still answer locally. `LAYA_PRELOAD`, `LAYA_MODELS`, `LAYA_DEVICE` and `LAYA_THREADS` are ignored; `LAYA_API_KEY` is sent as the bearer. `laya_shortlist` is refused (it needs in-process embeddings). See [Remote mode](#remote-mode-one-model-many-clients). |
+| `LAYA_REMOTE_TIMEOUT` | `300` | Seconds to wait for one answer from the remote `laya-serve`; covers its cold load when it unloads idle checkpoints. |
 
 The stock `laya-mcp-server` launcher creates its Router without installing hooks. If you need
 prediction hooks, use a custom launcher that installs them, for example with
 `laya.hooks.set_default_hooks`, before the server builds its Router. The environment variables
 above configure model lifecycle, not hook registration. The client still decides when to call a
 tool and what to do with the returned decision.
+
+### Remote mode: one model, many clients
+
+By default every `laya-mcp-server` process holds its own checkpoints. One agent on one machine is fine with that; two editor sessions plus a `laya-serve` for scripts is three copies of the same 1.3 GB. Point the MCP server at the HTTP server instead:
+
+```json
+{
+  "mcpServers": {
+    "laya": {
+      "command": "laya-mcp-server",
+      "env": { "LAYA_BASE_URL": "http://127.0.0.1:8000" }
+    }
+  }
+}
+```
+
+The MCP process then stays at a few tens of megabytes and never imports torch. Answers come from the server, with the server's own `routing` decision in each result, so the tools look exactly as they do in local mode. Pair it with `LAYA_IDLE_UNLOAD_SECONDS` on the server and the whole stack holds no weights at all while nothing is asking. What differs from local mode: `laya_shortlist` is refused, because it embeds options with the answering checkpoint in-process; per-call hooks are refused, as `laya-serve` refuses them; and `laya_route` answers from the MCP process's own routing configuration, which matches the server's when both see the same `LAYA_DEFAULT_MODEL` and `LAYA_AUTO_TASK`. HTTP failures come back as tool errors: `unreachable`, `unauthorized`, `busy` (the server's 503), `invalid_request` (its 400/422), `timeout`, `upstream_error`.
 
 ## 3. Shared boundaries and related guides
 

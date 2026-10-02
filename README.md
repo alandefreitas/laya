@@ -1187,6 +1187,7 @@ This is an **optional extra**: the core package has no `mcp` dependency.
 ```bash
 pip install "laya[mcp]"
 laya-mcp-server          # or: python -m laya.mcp.server
+LAYA_BASE_URL=http://127.0.0.1:8000 laya-mcp-server   # remote mode: answer from a running laya-serve, load nothing here
 ```
 
 Example MCP client configuration (stdio transport):
