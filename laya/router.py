@@ -28,13 +28,16 @@ primary routing signal.
 synthetic workflows and should not be a silent default.
 """
 import gc
+import hashlib
 import inspect
 import json
 import os
+import re
 import threading
 import time
+from collections.abc import Mapping as MappingABC
 from collections.abc import Sequence as SequenceABC
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .confidence import apply_confidence_gate, check_min_confidence
 from .hooks import (
@@ -90,6 +93,22 @@ _TYPED_DECISION_WORKFLOWS = {
     "security_incidents": {"credential_compromise", "disposition", "severity", "true_positive", "urgency"},
 }
 
+# What a caller may name a checkpoint of their own, once `canonical_name` has trimmed and
+# lowercased it (so `Papers` is registered as `papers`): letters, digits, `.`, `_` and `-`, starting
+# with a letter or digit. No `/`, because a Hub id or a path is a source, not a name.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def canonical_name(name: Any) -> str:
+    """Trim, lowercase and resolve an alias, without asking whether the result names a checkpoint.
+
+    The spelling half of :func:`normalise_name`. `Router.resolve` applies it and then checks the
+    Router's own registry, which holds the built-in checkpoints plus any the caller registered;
+    `normalise_name` applies it and checks the built-in table alone.
+    """
+    key = str(name).strip().lower()
+    return _ALIASES.get(key, key)
+
 
 class RouteDecision(dict):
     """The routing outcome: which model, why, and what was detected.
@@ -110,8 +129,14 @@ class RouteDecision(dict):
 
 
 def normalise_name(name: str) -> str:
-    key = str(name).strip().lower()
-    key = _ALIASES.get(key, key)
+    """Canonical name of a built-in checkpoint, or ValueError.
+
+    This is the registry of the checkpoints the package ships. A Router may know more -- the
+    checkpoints registered on it with `Router(models=...)` or `Router.register` -- and resolves
+    names through `Router.resolve`, which accepts those too. Code with no Router at hand (the CLI's
+    `--model`, `laya.load`) keeps using this one.
+    """
+    key = canonical_name(name)
     if key not in DEFAULT_MODELS:
         raise ValueError("unknown model %r; choose one of %s (or an alias: %s)"
                          % (name, sorted(DEFAULT_MODELS), sorted(_ALIASES)))
@@ -132,6 +157,183 @@ def resolve_model_spec(name: str) -> Optional[Tuple[str, Optional[str]]]:
     except ValueError:
         return None
     return tuple(_split(DEFAULT_MODELS[key]))
+
+
+_MISSING: Any = object()          # a name absent from `models`, as opposed to registered with source None
+_NOT_COMPUTED: Any = object()    # `match_signature(workflow=...)`: None already means "computed, no match"
+
+_DIGEST_PREFIX = "sha1:"
+_DIGEST_RE = re.compile(r"^sha1:[0-9a-f]{40}$", re.IGNORECASE)
+
+
+def instructions_digest(instructions: Any) -> Optional[str]:
+    """`sha1:<hex>` of a question's instructions, the form a signature pins them in; None for no instructions.
+
+    Text is compared with its whitespace collapsed, so a reflowed prompt is the same question.
+    Structured instructions (a dict or list) are compared as canonical JSON. A value that already
+    carries the `sha1:` prefix is returned as it is (lowercased), so a manifest may hold either the
+    text or the digest the decider logged; a `sha1:` value that is not 40 hex digits raises ValueError. The model never sees a question's id, only its instructions and
+    options, which is why the instructions are what ties a request to the checkpoint trained on it.
+    """
+    if instructions is None:
+        return None
+    if isinstance(instructions, str):
+        text = instructions.strip()
+        if text[:len(_DIGEST_PREFIX)].lower() == _DIGEST_PREFIX:
+            if not _DIGEST_RE.match(text):
+                raise ValueError("malformed digest %r: expected 'sha1:' and 40 hex digits" % (text,))
+            return text.lower()
+        canonical = " ".join(text.split())
+    else:
+        canonical = json.dumps(instructions, sort_keys=True, ensure_ascii=False, default=str)
+    return _DIGEST_PREFIX + hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+
+_FACETS = ("ids", "instructions", "options", "for")
+
+
+def _is_described(raw: Any) -> bool:
+    """True for the faceted shape `Signature.describe` reports: `ids` plus any of `instructions`, `options`, `for`."""
+    return (isinstance(raw, MappingABC) and "ids" in raw and set(raw) <= set(_FACETS)
+            and isinstance(raw["ids"], list)
+            and isinstance(raw.get("instructions", {}), MappingABC)
+            and isinstance(raw.get("options", {}), MappingABC))
+
+
+def options_key(question: Any) -> Any:
+    """What an `options` pin compares: the sorted choice labels, or the number of score levels.
+
+    A `choice` question's `criteria` is a mapping label -> description; only the labels count, so
+    rewording a description does not invalidate a checkpoint while adding or removing a label does.
+    A `choice` question may also send its labels as a plain list; they count the same way. A `score`
+    question's `criteria` is a list of level descriptions, and the count is what the head was trained
+    on. A `noul` question has no options to pin; it answers None, which never matches. A question
+    without a `type` is read by the shape of its criteria.
+    """
+    if not isinstance(question, MappingABC):
+        return None
+    criteria, kind = question.get("criteria"), question.get("type")
+    if kind == "noul":
+        return None
+    if kind == "choice" and isinstance(criteria, (list, tuple)):
+        return sorted(str(label) for label in criteria)
+    if isinstance(criteria, MappingABC):
+        return sorted(str(label) for label in criteria)
+    if isinstance(criteria, (list, tuple)):
+        return len(criteria)
+    return None
+
+
+class Signature:
+    """One way a request selects a registered checkpoint without naming it.
+
+    A signature is a set of facets, and every facet present must match. `ids` is always there: the
+    exact set of question ids the request must carry. `pins` maps some of those ids to the `sha1:`
+    digest of the instructions the question must carry under that id. `options` maps some of them
+    to the answer set the question must offer, as `options_key` reads it: the sorted choice labels,
+    or the number of score levels. Which facets a checkpoint pins says what it can survive: a kind
+    whose answers never change pins its options too, and a changed label set then falls back to the
+    base model instead of being answered by a checkpoint that never saw the new labels; a kind whose
+    answers change every batch (the sections of a growing tree) pins instructions only, because the
+    checkpoint learned to read option descriptions. `purpose` is free text for the reader and takes
+    no part in matching.
+
+    The signature with the most pinned facets is tried first, so two checkpoints may share an id set
+    and be told apart by what they ask; two signatures on one id set whose facets neither contain
+    nor contradict each other cannot belong to two checkpoints.
+    """
+
+    __slots__ = ("ids", "pins", "options", "purpose")
+
+    def __init__(self, ids: Iterable[str], pins: Optional[Dict[str, str]] = None,
+                 options: Optional[Dict[str, Any]] = None, purpose: Optional[str] = None):
+        if isinstance(ids, (str, bytes)) or not isinstance(ids, Iterable):
+            raise TypeError("Signature ids must be an iterable of question ids, not %r" % (ids,))
+        self.ids: FrozenSet[str] = frozenset(ids)
+        self.pins: Dict[str, str] = dict(pins or {})
+        self.options: Dict[str, Any] = {str(q): _canonical_options(v) for q, v in (options or {}).items()}
+        self.purpose: Optional[str] = purpose
+
+    def matches(self, questions: Dict[str, Any]) -> bool:
+        if frozenset(questions) != self.ids:
+            return False
+        for qid, digest in self.pins.items():
+            question = questions.get(qid)
+            asked = question.get("instructions") if isinstance(question, MappingABC) else None
+            try:
+                if instructions_digest(asked) != digest:
+                    return False
+            except ValueError:      # the request's own text looks like a malformed digest: no match
+                return False
+        for qid, want in self.options.items():
+            if options_key(questions.get(qid)) != want:
+                return False
+        return True
+
+    def _facets(self) -> Dict[Tuple[str, str], Any]:
+        facets: Dict[Tuple[str, str], Any] = {("instructions", q): d for q, d in self.pins.items()}
+        facets.update({("options", q): _hashable(v) for q, v in self.options.items()})
+        return facets
+
+    def conflicts(self, other: "Signature") -> bool:
+        """True when some request matches both and neither is the more specific claim.
+
+        The ids must be equal and no shared facet may contradict. If one signature's facets strictly
+        contain the other's, that one is more specific and is tried first, so there is no conflict.
+        """
+        if self.ids != other.ids:
+            return False
+        mine, theirs = self._facets(), other._facets()
+        if any(theirs[k] != v for k, v in mine.items() if k in theirs):
+            return False
+        a, b = mine.items(), theirs.items()
+        return not (a < b or b < a)
+
+    def specificity(self) -> int:
+        """How many facets beyond the ids are pinned; the most specific signature is tried first."""
+        return len(self.pins) + len(self.options)
+
+    def describe(self) -> Any:
+        """The serialisable form `registered` reports: a sorted id list, or `ids` plus the facets present."""
+        if not self.pins and not self.options and self.purpose is None:
+            return sorted(self.ids)
+        out: Dict[str, Any] = {"ids": sorted(self.ids)}
+        if self.pins:
+            out["instructions"] = dict(sorted(self.pins.items()))
+        if self.options:
+            out["options"] = dict(sorted(self.options.items()))
+        if self.purpose is not None:
+            out["for"] = self.purpose
+        return out
+
+    def __eq__(self, other: Any) -> bool:
+        return (isinstance(other, Signature) and self.ids == other.ids and self.pins == other.pins
+                and self.options == other.options)
+
+    def __hash__(self) -> int:
+        return hash((self.ids, tuple(sorted(self._facets().items()))))
+
+    def __repr__(self) -> str:
+        return "Signature(ids=%r, pins=%r, options=%r)" % (sorted(self.ids), self.pins, self.options)
+
+
+def _canonical_options(value: Any) -> Any:
+    """An `options` pin as `options_key` would produce it: a sorted list of labels, or a level count."""
+    if isinstance(value, bool) or not isinstance(value, (int, list, tuple)):
+        raise TypeError("an options pin must be a list of choice labels or a score level count, got %r" % (value,))
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError("a score level count must be positive, got %r" % (value,))
+        return value
+    if not value or any(not isinstance(v, str) or not v.strip() for v in value):
+        raise ValueError("an options pin must list non-empty labels, got %r" % (value,))
+    if len(set(value)) != len(value):
+        raise ValueError("an options pin lists a label twice: %r" % (value,))
+    return sorted(value)
+
+
+def _hashable(value: Any) -> Any:
+    return tuple(value) if isinstance(value, list) else value
 
 
 def match_typed_decisions_workflow(questions: Dict[str, Any]) -> Optional[str]:
@@ -260,7 +462,7 @@ def check_agent_kwargs(agent_kwargs: Dict[str, Any]) -> None:
             % (", ".join(repr(n) for n in unknown), sorted(accepted - _ROUTER_OWNED_AGENT_ARGS)))
 
 
-def _digests_from_env(models: Dict[str, Any]) -> Dict[str, Optional[Dict[str, str]]]:
+def _digests_from_env(models: Dict[str, Any], resolve=normalise_name) -> Dict[str, Optional[Dict[str, str]]]:
     """Turn `LAYA_SHA256_DIGESTS` into per-checkpoint digest maps when it names models.
 
     The variable has two shapes, and the value types say which. A flat
@@ -297,9 +499,9 @@ def _digests_from_env(models: Dict[str, Any]) -> Dict[str, Optional[Dict[str, st
         raise ValueError("LAYA_SHA256_DIGESTS must be either {artifact: digest} for every "
                          "checkpoint or {model: {artifact: digest}} per checkpoint; %s mixes "
                          "the two or holds a value that is neither" % sorted(data))
-    per_model = {normalise_name(k): dict(v) for k, v in data.items()}
+    per_model = {resolve(k): dict(v) for k, v in data.items()}
     for name in models:
-        per_model.setdefault(normalise_name(name), {})
+        per_model.setdefault(resolve(name), {})
     return per_model
 
 
@@ -386,6 +588,69 @@ class _InFlightBuild:
     def __init__(self):
         self.done = threading.Event()
         self.error: Optional[BaseException] = None
+
+
+def _pin(key: str, qid: Any, value: Any) -> str:
+    """The digest a pin of `value` on question `qid` stands for; refuses what could never match."""
+    if not isinstance(value, (str, MappingABC, list)) or (isinstance(value, str) and not value.strip()):
+        raise TypeError("signature for %r pins question %r to %r; expected the instructions text, "
+                        "its sha1: digest, or null" % (key, qid, value))
+    return instructions_digest(value)
+
+
+def parse_signature(key: str, raw: Any) -> Signature:
+    """A `Signature` from any accepted form: an id list, an id -> instructions mapping, the faceted
+    object `registered` reports, or a `Signature`. Refuses what could never match. `key` names the
+    checkpoint in error messages. Module-level so the store validates manifests with the same code
+    and without the Router class, which tests may replace.
+    """
+    options: Dict[str, Any] = {}
+    purpose: Optional[str] = None
+    if isinstance(raw, Signature):      # same checks as the other forms: text pins hash, digests normalise
+        ids = raw.ids
+        if not all(isinstance(q, str) for q in ids):
+            raise TypeError("signature for %r has non-text question ids %r" % (key, sorted(ids, key=repr)))
+        pins = {q: _pin(key, q, v) for q, v in raw.pins.items() if v is not None}
+        options, purpose = dict(raw.options), raw.purpose
+    elif _is_described(raw):    # the faceted shape `registered` reports, so it round-trips
+        if not all(isinstance(q, str) for q in raw["ids"]):
+            raise TypeError("signature for %r: 'ids' must be a list of question-id strings, got %r"
+                            % (key, raw["ids"]))
+        ids = frozenset(raw["ids"])
+        pins = {}
+        for qid, value in raw.get("instructions", {}).items():
+            if value is not None:
+                pins[str(qid)] = _pin(key, qid, value)
+        for qid, value in raw.get("options", {}).items():
+            if value is not None:
+                options[str(qid)] = value
+        purpose = raw.get("for")
+    elif isinstance(raw, MappingABC):
+        if "ids" in raw:    # the faceted shape, malformed; a question id literally named "ids" is not supported
+            raise TypeError("signature for %r has an 'ids' key but is not a valid faceted object: it takes "
+                            "'ids' (a list) and optionally 'instructions' and 'options' (mappings) and 'for' "
+                            "(text), and nothing else, got %r" % (key, raw))
+        ids = frozenset(str(q) for q in raw)
+        pins = {}
+        for qid, value in raw.items():
+            if value is None:
+                continue
+            pins[str(qid)] = _pin(key, qid, value)
+    elif isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+        raise TypeError("each signature for %r must be a set of question ids, a mapping from question id "
+                        "to instructions, or a faceted {ids, instructions, options, for} object, got %r"
+                        % (key, raw))
+    else:
+        ids, pins = frozenset(str(q) for q in raw), {}
+    if purpose is not None and (not isinstance(purpose, str) or not purpose.strip()):
+        raise TypeError("signature for %r: 'for' must be a non-empty string, got %r" % (key, purpose))
+    if not ids or any(not q.strip() for q in ids):
+        raise ValueError("a signature for %r is empty or holds a blank question id: %r" % (key, sorted(ids)))
+    for facet, pinned in (("instructions", set(pins)), ("options", set(options))):
+        if not pinned <= ids:
+            raise ValueError("signature for %r pins %s of %s, which are not among its ids %s"
+                             % (key, facet, sorted(pinned - ids), sorted(ids)))
+    return Signature(ids, pins, options, purpose)
 
 
 class Router(HookRegistry):
@@ -543,6 +808,7 @@ class Router(HookRegistry):
         hooks_timeout: Optional[float] = None,
         agent_kwargs: Optional[Dict[str, Any]] = None,
         sha256_digests: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
+        signatures: Optional[Dict[str, Iterable[Any]]] = None,
     ):
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
@@ -550,9 +816,20 @@ class Router(HookRegistry):
         self.hooks_timeout = None if hooks_timeout is None else validate_timeout(hooks_timeout)
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
-        self.models = dict(STANDALONE_MODELS if standalone_repos else DEFAULT_MODELS)
-        if models:
-            self.models.update({normalise_name(k): v for k, v in models.items()})
+        # The registry: built-in names first, then whatever the caller adds. A key that is a
+        # built-in name re-points that checkpoint (a fine-tune standing in for `english`); any
+        # other key registers a checkpoint of the caller's own, served beside the built-ins and
+        # named in `model=` like one of them. `signatures` maps a registered name to the question-id
+        # sets that select it without `model=`, the way the typed-decisions workflows select theirs.
+        self.models: Dict[str, Any] = dict(STANDALONE_MODELS if standalone_repos else DEFAULT_MODELS)
+        self.signatures: Dict[str, List[Signature]] = {}
+        # Free text per registered checkpoint, reported by `registered` (and so by `/health` and
+        # `laya_status`); a public mutable attribute like `sha256_digests`, filled by `register`.
+        self.descriptions: Dict[str, str] = {}
+        for k, v in (models or {}).items():
+            self._add(k, v)
+        for k, sigs in (signatures or {}).items():
+            self._add_signatures(self.resolve(k), sigs)
         self.device = device
         self.token = token or os.environ.get("HF_TOKEN")
         # Optional Hub revision (commit SHA/branch/tag) applied to every checkpoint load.
@@ -560,7 +837,7 @@ class Router(HookRegistry):
         # reviewed commits differ.
         self.revision = revision
         self.revisions: Dict[str, Optional[str]] = {
-            normalise_name(k): v for k, v in (revisions or {}).items()
+            self.resolve(k): v for k, v in (revisions or {}).items()
         }
         # Options forwarded to every `Agent` this Router builds, checked now so a bad name fails on
         # this line rather than the first request that happens to load a checkpoint.
@@ -571,11 +848,11 @@ class Router(HookRegistry):
         # overridden checkpoint by checkpoint by the argument. Keyed and normalised exactly like
         # `revisions`, so a misspelled model name fails here rather than leaving that checkpoint
         # unverified.
-        self.sha256_digests: Dict[str, Optional[Dict[str, str]]] = _digests_from_env(self.models)
-        argument = {normalise_name(k): v for k, v in (sha256_digests or {}).items()}
+        self.sha256_digests: Dict[str, Optional[Dict[str, str]]] = _digests_from_env(self.models, self.resolve)
+        argument = {self.resolve(k): v for k, v in (sha256_digests or {}).items()}
         self.sha256_digests.update(argument)
         self.max_loaded = max(1, int(max_loaded))
-        self.default = normalise_name(default)
+        self.default = self.resolve(default)
         self.auto_task_detection = bool(auto_task_detection)
         # An opt-in language hint installed for every request: a code, or a callable taking the
         # state and returning one (or None to abstain). Checked before the built-in detection,
@@ -602,13 +879,189 @@ class Router(HookRegistry):
         if preload:
             self.preload()
 
+    # ------------------------------------------------------------------ registry
+    def resolve(self, name: Any) -> str:
+        """Canonical key of a checkpoint this Router knows: built-in, aliased, or registered.
+
+        The instance counterpart of :func:`normalise_name`. Everything on the Router that takes a
+        checkpoint name goes through here, so a checkpoint registered under `papers` is accepted
+        wherever `english` is: `model=`, `task=`, `load`, `unload`, `preload`, `revisions`.
+        """
+        key = canonical_name(name)
+        if key in self.models:
+            return key
+        raise ValueError("unknown model %r; choose one of %s (or an alias: %s)"
+                         % (name, sorted(self.models), sorted(_ALIASES)))
+
+    def register(self, name: str, source: Any, signatures: Optional[Iterable[Any]] = None,
+                 description: Optional[str] = None) -> str:
+        """Add a checkpoint under `name`, to be served beside the built-in ones.
+
+        `source` is what `laya.load` accepts: a Hub repo id, a `(repo, subfolder)` pair, or a local
+        directory holding `model.safetensors` and `rl_agent_config.json` -- a fine-tune exported by
+        the training recipe, for instance. Nothing is downloaded or built here; the checkpoint loads
+        on first use like the built-ins, is evicted and unloaded like them, and counts toward
+        `max_loaded` like them.
+
+        `signatures` lists the ways a request selects this checkpoint when it names no `model`.
+        Each is either a set of question ids (`["section"]`): a request whose question ids are
+        exactly that set goes here, the same exact match the typed-decisions workflows use; or a
+        mapping from question id to the instructions text of that question (or its
+        `instructions_digest`), which also requires the request's question under that id to carry
+        those instructions. The mapping form ties the checkpoint to the questions it was trained on,
+        so two workflows that both ask a `section` question with different wording are told apart.
+        The faceted object `{"ids": [...], "instructions": {...}, "options": {...}, "for": "..."}` also
+        pins the answer set of a question (`options`: sorted choice labels or a score level count);
+        every facet present must match, and `for` is documentation only.
+        Several signatures may name one checkpoint, because a fine-tune usually covers a few related
+        question formats. A signature already registered for another checkpoint is refused, since
+        the router could not tell the two apart. Passing `signatures` for a name that is already
+        registered replaces its signatures (the list given is the whole set); leaving it out keeps them.
+
+        `description` is free text about the checkpoint for whoever reads `registered`.
+
+        Returns the canonical name. Registering an existing name replaces its source.
+        """
+        with self._lock:
+            key = canonical_name(name)
+            missing = object()      # a present None (an opted-out digest entry) is not an absent key
+            before = (self.models.get(key, missing), self.sha256_digests.get(key, missing),
+                      self.descriptions.get(key, missing),
+                      list(self.signatures[key]) if key in self.signatures else missing)
+            try:
+                key = self._add(name, source)
+                if key not in self.sha256_digests:
+                    # A nested LAYA_SHA256_DIGESTS names no file of this checkpoint: the `{}` placeholder
+                    # the constructor gives every model keeps `verify_digests` off the nested map.
+                    placeholder = _digests_from_env([key], canonical_name).get(key)
+                    if placeholder is not None:
+                        self.sha256_digests[key] = placeholder
+                if signatures is not None:
+                    self.signatures.pop(key, None)      # the list given is the whole set, not an addition
+                    self._add_signatures(key, signatures)
+                if description is not None:
+                    self.descriptions[key] = str(description)
+            except BaseException:       # a refused register() leaves the router as it was
+                for table, old in ((self.models, before[0]), (self.sha256_digests, before[1]),
+                                   (self.descriptions, before[2]), (self.signatures, before[3])):
+                    if old is missing:
+                        table.pop(key, None)
+                    else:
+                        table[key] = old
+                raise
+        return key
+
+    def unregister(self, name: str) -> None:
+        """Remove a registered checkpoint: its source, signatures, description, pins and resident Agent.
+
+        A built-in name is refused (re-point it with `register`, it cannot be removed), and so is a
+        name the router does not know. A resident Agent is unloaded first, waiting for an in-flight
+        build of it, so a request that already holds it finishes; a request that names it afterwards
+        gets the usual unknown-model error.
+        """
+        key = self.resolve(name)
+        if key in DEFAULT_MODELS:
+            raise ValueError("%r is a built-in checkpoint and cannot be unregistered" % key)
+        with self._lock:
+            self.models.pop(key, None)      # first, so no new load can start a build of it
+            self.signatures.pop(key, None)  # and no request can match it into the missing model
+        freed = self._unload_key(key)       # waits for a build that had already read its source
+        with self._lock:
+            for table in (self.signatures, self.descriptions, self.sha256_digests, self.revisions):
+                table.pop(key, None)
+            self._agents.pop(key, None)
+            if key in self._order:
+                self._order.remove(key)
+        self._dispatch_lifecycle("on_evict", freed)
+
+    @property
+    def registered(self) -> Dict[str, Dict[str, Any]]:
+        """The checkpoints registered beside the built-ins: name -> source, signatures, description.
+
+        Serialisable as it is; `/health` and `laya_status` report it under `registered`.
+        """
+        with self._lock:
+            return {
+                name: {
+                    "source": _repo_str(spec),
+                    "signatures": [sig.describe() for sig in self.signatures.get(name, [])],
+                    "description": self.descriptions.get(name),
+                }
+                for name, spec in self.models.items() if name not in DEFAULT_MODELS
+            }
+
+    def _add(self, name: Any, source: Any) -> str:
+        """`register` without the lock, for the constructor."""
+        key = canonical_name(name)
+        if key not in DEFAULT_MODELS:
+            if not isinstance(name, str) or not _NAME_RE.match(key):
+                raise ValueError("invalid checkpoint name %r: use lowercase letters, digits, '.', '_' or '-', "
+                                 "starting with a letter or digit" % (name,))
+            if key == "auto":
+                raise ValueError("invalid checkpoint name %r: 'auto' means automatic routing in every "
+                                 "model= argument" % (name,))
+        if source is not None and not isinstance(source, (str, tuple, list)):
+            raise TypeError("checkpoint source for %r must be a repo id, a local path or a (repo, subfolder) "
+                            "pair, got %s" % (name, type(source).__name__))
+        if isinstance(source, str) and source.startswith("~"):
+            source = os.path.expanduser(source)     # a local path, never a Hub repo id
+        self.models[key] = source
+        return key
+
+    def _add_signatures(self, key: str, signatures: Iterable[Any]) -> None:
+        if isinstance(signatures, (str, bytes, MappingABC)) or not isinstance(signatures, Iterable):
+            raise TypeError("signatures for %r must be a list of question-id sets or id-to-instructions mappings" % key)
+        for raw in signatures:
+            sig = self._parse_signature(key, raw)
+            for other, sigs in self.signatures.items():
+                if other != key and any(sig.conflicts(prior) for prior in sigs):
+                    raise ValueError("signature %s is already registered for %r or cannot be told apart from one "
+                                     "of its signatures; a request must select one checkpoint only"
+                                     % (sig.describe(), other))
+            self.signatures.setdefault(key, [])
+            if sig not in self.signatures[key]:
+                self.signatures[key].append(sig)
+
+    _pin = staticmethod(lambda key, qid, value: _pin(key, qid, value))
+
+    @staticmethod
+    def _parse_signature(key: str, raw: Any) -> Signature:
+        return parse_signature(key, raw)
+
+    def match_signature(self, questions: Optional[Dict[str, Any]],
+                        workflow: Any = _NOT_COMPUTED) -> Optional[Tuple[str, str]]:
+        """`(model, label)` for the checkpoint whose registered signature these question ids are, else None.
+
+        Registered signatures are checked first and always: registering one is the opt-in. The four
+        built-in typed-decisions workflows come after, and only with `auto_task_detection=True`,
+        as before. The label is the workflow name for a built-in match and the checkpoint name for
+        a registered one; it lands in `RouteDecision["workflow"]`. A caller that already ran
+        `match_typed_decisions_workflow` on these questions passes the result as `workflow`, None
+        included (no match), so the workflow sets are walked once.
+        """
+        if questions:
+            with self._lock:    # `register` may be adding signatures from another thread
+                registered = list(self.signatures.items())
+            # Most pinned facets first: one that also names the instructions or the options is the
+            # more specific claim, so two checkpoints may share an id set and be told apart.
+            candidates = [(model, sig) for model, sigs in registered for sig in sigs]
+            candidates.sort(key=lambda c: -c[1].specificity())  # stable: most pinned facets first
+            for model, sig in candidates:
+                if sig.matches(questions):
+                    return model, model
+        if workflow is _NOT_COMPUTED:
+            workflow = match_typed_decisions_workflow(questions or {})
+        if workflow and self.auto_task_detection:
+            return "typed-decisions", workflow
+        return None
+
     # ------------------------------------------------------------------ loading
     def load(self, name: str):
         """Return the Agent for `name`, downloading and building it on first use.
 
         Concurrent callers share a single Agent instead of building duplicates.
         """
-        key = normalise_name(name)
+        key = self.resolve(name)
         while True:
             with self._lock:
                 if key in self._agents:
@@ -668,6 +1121,9 @@ class Router(HookRegistry):
         """Construct the Agent for `key`: config is read under `_lock`, the build runs outside it."""
         from .agent import Agent
         with self._lock:
+            if self.models.get(key) is None:
+                raise ValueError("checkpoint %r has no source to load from: it was attached as a built Agent "
+                                 "and is no longer resident; attach it again, or register a path or repo" % key)
             repo, sub = _split(self.models[key])
             kwargs = {"device": self.device, "token": self.token, "subfolder": sub}
             # A None or blank entry in `revisions` is "no pin of its own", so the checkpoint
@@ -737,9 +1193,16 @@ class Router(HookRegistry):
         Useful when the process has a checkpoint loaded for other reasons: a demo that already
         built `convaiinnovations/laya` can hand it to the router rather than pay for -- and hold
         in memory -- a duplicate 421M parameters.
+
+        A name the Router does not know yet is registered on the spot, with no source: the agent
+        serves under that name while resident, and loading it again after an unload needs
+        `register(name, source)` first.
         """
-        key = normalise_name(name)
         with self._lock:
+            try:
+                key = self.resolve(name)
+            except ValueError:
+                key = self._add(name, None)
             self._agents[key] = agent
             self._touch(key)
             self.max_loaded = max(self.max_loaded, len(self._agents))
@@ -753,7 +1216,12 @@ class Router(HookRegistry):
         server or a demo. `max_loaded` is raised to fit both the requested checkpoints and
         all already-resident agents, so incremental preloading does not evict either.
         """
-        names = [normalise_name(n) for n in (list(self.models) if names is None else names)]
+        if names is None:
+            # Every checkpoint that has a source to build from; an `attach`ed agent registered
+            # without one is resident already and would raise here once evicted.
+            with self._lock:
+                names = [n for n, source in self.models.items() if source is not None]
+        names = [self.resolve(n) for n in names]
         with self._lock:
             self.max_loaded = max(self.max_loaded, len(set(names) | set(self._agents)))
         for n in names:
@@ -764,6 +1232,33 @@ class Router(HookRegistry):
                 self.load(n)
         return self
 
+    def _unload_key(self, key: str) -> List[str]:
+        """`unload` for a canonical key that may already be gone from `models`; returns what it freed."""
+        freed: List[str] = []
+        while True:
+            with self._lock:
+                inflight = self._loading.get(key)
+                if inflight is None:
+                    agent = self._agents.pop(key, None)
+                    if key in self._order:
+                        self._order.remove(key)
+                    freed = [key] if agent is not None else []
+                    del agent
+                    gc.collect()
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if hasattr(torch, "xpu") and torch.xpu.is_available():
+                            torch.xpu.empty_cache()
+                        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                            torch.mps.empty_cache()
+                    except Exception:
+                        pass
+                    break
+            inflight.done.wait()
+        return freed
+
     def unload(self, name: Optional[str] = None):
         """Free one model, or all of them."""
         # When unloading a specific checkpoint, wait only for an in-flight build of THAT
@@ -771,29 +1266,7 @@ class Router(HookRegistry):
         # When unloading all checkpoints (`name is None`), wait for all in-flight builds.
         freed: List[str] = []
         if name is not None:
-            key = normalise_name(name)
-            while True:
-                with self._lock:
-                    inflight = self._loading.get(key)
-                    if inflight is None:
-                        agent = self._agents.pop(key, None)
-                        if key in self._order:
-                            self._order.remove(key)
-                        freed = [key] if agent is not None else []
-                        del agent
-                        gc.collect()
-                        try:
-                            import torch
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            if hasattr(torch, "xpu") and torch.xpu.is_available():
-                                torch.xpu.empty_cache()
-                            if hasattr(torch, "mps") and torch.backends.mps.is_available():
-                                torch.mps.empty_cache()
-                        except Exception:
-                            pass
-                        break
-                inflight.done.wait()
+            freed = self._unload_key(self.resolve(name))
         else:
             while True:
                 with self._lock:
@@ -893,21 +1366,31 @@ class Router(HookRegistry):
         which lets a language-identification model abstain. Pass one here, or set
         `Router(lang_guess=...)` to apply it to every request.
         """
+        # `.get`, not `[]`: a RemoteRouter resolves names its own table does not hold, because the
+        # server it answers from owns the registry, and such a name has no repo to report here.
         if model is not None:
-            key = normalise_name(model)
-            return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit model=%r" % model,
+            key = self.resolve(model)
+            return RouteDecision(model=key, repo=_repo_str(self.models.get(key)), reason="explicit model=%r" % model,
                                  detection=None, workflow=None)
 
         if task is not None:
-            key = normalise_name("typed-decisions" if str(task).lower().replace("-", "_") == "typed_decisions" else task)
-            return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit task=%r" % task,
+            key = self.resolve("typed-decisions" if str(task).lower().replace("-", "_") == "typed_decisions" else task)
+            return RouteDecision(model=key, repo=_repo_str(self.models.get(key)), reason="explicit task=%r" % task,
                                  detection=None, workflow=None)
 
         workflow = match_typed_decisions_workflow(questions or {})
-        if workflow and self.auto_task_detection:
-            return RouteDecision(model="typed-decisions", repo=_repo_str(self.models["typed-decisions"]),
-                                 reason="question ids match the %r typed-decisions workflow" % workflow,
-                                 detection=None, workflow=workflow)
+        matched = self.match_signature(questions, workflow)
+        matched_source = self.models.get(matched[0], _MISSING) if matched is not None else None
+        if matched is not None and matched_source is _MISSING:
+            matched = None      # unregistered since the match: route by language, as if nothing matched
+        if matched is not None:
+            key, label = matched
+            if key == "typed-decisions" and label == workflow:
+                reason = "question ids match the %r typed-decisions workflow" % workflow
+            else:
+                reason = "question ids match a signature registered for %r" % key
+            return RouteDecision(model=key, repo=_repo_str(matched_source), reason=reason,
+                                 detection=None, workflow=label)
 
         if lang is not None:
             # An explicit `lang` is decisive only when the code names a language. Blank or
@@ -1277,7 +1760,7 @@ class Router(HookRegistry):
             # Indexed, not `.model`: an on_route hook may replace the decision with a plain dict,
             # which `predict` accepts too. Normalised, because such a hook may name the checkpoint
             # by an alias ("ml"), and that request must share its checkpoint's forward pass.
-            groups.setdefault(normalise_name(decision["model"]), []).append(i)
+            groups.setdefault(self.resolve(decision["model"]), []).append(i)
 
         # Counted rather than marked with None: an end hook may leave a None result, which
         # `predict` returns as it is.

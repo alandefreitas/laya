@@ -87,6 +87,32 @@ check_param("Router.__init__", Router.__init__, "revisions", None)
 check_param("Router.__init__", Router.__init__, "agent_kwargs", None)
 # ...and the per-checkpoint digests that `revisions` has always had a sibling need for
 check_param("Router.__init__", Router.__init__, "sha256_digests", None)
+# ...and the checkpoints a caller registers beside the built-ins, with the question-id sets that
+# select them without `model=`; `register`, `resolve` and `match_signature` are the instance side
+check_param("Router.__init__", Router.__init__, "signatures", None)
+check_param("Router.register", Router.register, "signatures", None)
+check_true("Router/resolve", callable(getattr(Router, "resolve", None)))
+check_true("Router/match_signature", callable(getattr(Router, "match_signature", None)))
+# ...and removing one again, which is what a reloaded store does for a checkpoint that left it
+check_param("Router.unregister", Router.unregister, "name", inspect.Parameter.empty)
+from laya.store import scan  # noqa: E402
+check_param("scan", scan, "root", None)
+check_param("scan", scan, "keep", None)
+# ...and the instruction pin: the digest a manifest stores, and the Signature that carries it
+from laya.router import Signature, instructions_digest  # noqa: E402
+check_true("router/instructions_digest is a known digest",
+           instructions_digest("Which section?") == "sha1:b65b4dbcfc4a7efd6cf009d0da00ceed3328efc9")
+check_true("router/Signature(ids, pins) matches by exact ids",
+           Signature(["a"]).matches({"a": {}}) and not Signature(["a"]).matches({"a": {}, "b": {}}))
+# ...and the option pin: the answer set a question must offer, and the purpose text beside it
+from laya.router import options_key, parse_signature  # noqa: E402
+check_param("Signature.__init__", Signature.__init__, "options", None)
+check_param("Signature.__init__", Signature.__init__, "purpose", None)
+check_true("router/options_key reads choice labels and score levels",
+           options_key({"criteria": {"b": "", "a": ""}}) == ["a", "b"] and options_key({"criteria": ["x", "y"]}) == 2)
+check_true("router/parse_signature reads the faceted form",
+           parse_signature("k", {"ids": ["a"], "options": {"a": ["y", "x"]}, "for": "t"}).describe()
+           == {"ids": ["a"], "options": {"a": ["x", "y"]}, "for": "t"})
 
 # What the constructor does NOT raise over is part of its contract too: a shared
 # `agent_kwargs["expected_sha256"]` overlapping a per-checkpoint `sha256_digests` entry on one file

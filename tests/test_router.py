@@ -1608,6 +1608,749 @@ check("lang-code/agnostic primary wins over its subtag", _english_from_code("C.U
 check("lang-code/posix with a modifier abstains", _english_from_code("POSIX-1"), None)
 
 
+# --------------------------------------------------------------------- registered checkpoints
+# A Router serves the checkpoints a caller registers beside the built-in three: named in `model=`
+# like them, loaded, evicted and unloaded like them, and selected without `model=` by the set of
+# question ids a request carries, the way the typed-decisions workflows have always been.
+from laya.router import Signature, canonical_name, instructions_digest  # noqa: E402
+
+check("registry/canonical lowercases and aliases", canonical_name(" ML "), "multilingual")
+check("registry/canonical leaves an unknown name as typed", canonical_name("Papers"), "papers")
+
+_SECTION_Q = {"section": {"type": "choice", "instructions": "Which section?", "criteria": {"a": "A", "b": "B"}}}
+_TWO_Q = {"section": _SECTION_Q["section"], "subsection": _SECTION_Q["section"]}
+_CLAIM = "Transparency improved operator performance in 11 of 17 studies."
+r = Router(models={"papers": "/tmp/laya-papers", "tone": ("acme/laya-tone", None)},
+           signatures={"papers": [["section"], ["subsection", "section"]]})
+check("registry/registered names resolve", r.resolve("papers"), "papers")
+check("registry/registered names resolve case-insensitively", r.resolve(" PAPERS "), "papers")
+check("registry/built-ins still resolve", r.resolve("ml"), "multilingual")
+check("registry/models holds built-ins plus registered", sorted(r.models),
+      ["english", "multilingual", "papers", "tone", "typed-decisions"])
+check("registry/signatures are Signature objects per checkpoint", r.signatures,
+      {"papers": [Signature(["section"]), Signature(["section", "subsection"])]})
+try:
+    r.resolve("nope")
+    check("registry/unknown name raises", False, True)
+except ValueError as e:
+    check("registry/unknown name lists the registered ones too", "'papers'" in str(e), True)
+
+d = r.route(_CLAIM, _SECTION_Q)
+check("signature/one id set routes to the registered checkpoint", d.model, "papers")
+check("signature/reason names the checkpoint", "signature registered for 'papers'" in d.reason, True)
+check("signature/workflow label is the checkpoint name", d["workflow"], "papers")
+check("signature/no detection ran", d["detection"], None)
+check("signature/repo is the registered source", d["repo"], "/tmp/laya-papers")
+check("signature/a second id set routes to the same checkpoint", r.route(_CLAIM, _TWO_Q).model, "papers")
+check("signature/a superset of ids is not a match",
+      r.route(_CLAIM, {**_SECTION_Q, "extra": _SECTION_Q["section"]}).model, "english")
+check("signature/a subset of ids is not a match",
+      r.route(_CLAIM, {"subsection": _SECTION_Q["section"]}).model, "english")
+check("signature/explicit model= outranks it", r.route(_CLAIM, _SECTION_Q, model="tone").model, "tone")
+check("signature/explicit task= outranks it", r.route(_CLAIM, _SECTION_Q, task="tone").model, "tone")
+check("signature/registered source shows as repo", r.route(_CLAIM, _SECTION_Q, model="tone")["repo"], "acme/laya-tone")
+check("signature/registering is the opt-in: auto_task_detection stays off", r.auto_task_detection, False)
+check("signature/route_batch keeps the mix in order",
+      [x.model for x in r.route_batch([{"state": _CLAIM, "questions": _SECTION_Q},
+                                       {"state": _CLAIM, "questions": {"q": _SECTION_Q["section"]}},
+                                       {"state": _CLAIM, "questions": _TWO_Q, "model": "english"}])],
+      ["papers", "english", "english"])
+
+# The built-in typed-decisions workflows keep their opt-in, and a registered signature that
+# happens to equal one of them wins, because registering it is the more specific instruction.
+_CS = {q: _SECTION_Q["section"] for q in ("action", "category", "churn_risk", "needs_human", "urgency")}
+check("signature/built-in workflow still needs auto_task_detection", r.route(_CLAIM, _CS).model, "english")
+check("signature/built-in workflow with auto_task_detection",
+      Router(auto_task_detection=True).route(_CLAIM, _CS)["workflow"], "customer_service")
+r_cs = Router(models={"papers": "/tmp/laya-papers"}, signatures={"papers": [list(_CS)]}, auto_task_detection=True)
+check("signature/registered set equal to a built-in one wins", r_cs.route(_CLAIM, _CS).model, "papers")
+check("signature/match_signature reports the pair", r_cs.match_signature(_CS), ("papers", "papers"))
+check("signature/match_signature on no questions", r_cs.match_signature({}), None)
+check("signature/match_signature on a built-in set", Router(auto_task_detection=True).match_signature(_CS),
+      ("typed-decisions", "customer_service"))
+check("signature/match_signature takes the workflow already computed",
+      Router(auto_task_detection=True).match_signature(_CS, "customer_service"), ("typed-decisions", "customer_service"))
+
+# R1-8: the workflow sets are walked once per route, whether or not the questions match one.
+import laya.router as _router_mod
+for _label, _qs in (("matching", _CS), ("non-matching", {"x": {}}), ("none", None)):
+    _calls = []
+    _real_match = _router_mod.match_typed_decisions_workflow
+    with patch.object(_router_mod, "match_typed_decisions_workflow",
+                      lambda q, _f=_real_match: _calls.append(1) or _f(q)):
+        Router(preload=False).route(_CLAIM, _qs)
+    check("signature/route walks the workflow sets once for %s questions" % _label, len(_calls), 1)
+
+# R1-14: a checkpoint registered after construction is not read as an artifact map of a nested env.
+_old_env = os.environ.get("LAYA_SHA256_DIGESTS")
+os.environ["LAYA_SHA256_DIGESTS"] = '{"english": {"model.safetensors": "%s"}}' % ("c" * 64)
+try:
+    _r_late = Router()
+    _r_late.register("mine", "/tmp/laya-mine")
+    check("register/nested LAYA_SHA256_DIGESTS gives a later checkpoint the empty placeholder",
+          _r_late.sha256_digests["mine"], {})
+finally:
+    if _old_env is None:
+        os.environ.pop("LAYA_SHA256_DIGESTS", None)
+    else:
+        os.environ["LAYA_SHA256_DIGESTS"] = _old_env
+
+# R1-15: a source starting with ~ is a local path.
+check("register/~ in a source is expanded", Router(models={"mine": "~/laya-mine"}).models["mine"],
+      os.path.expanduser("~/laya-mine"))
+
+# R1-16: `auto` is the routing word everywhere, so it cannot name a checkpoint.
+try:
+    Router().register("auto", "/tmp/laya-auto")
+    check("register/auto is refused", True, False)
+except ValueError as _e:
+    check("register/auto is refused", "auto" in str(_e), True)
+
+# R1-5: routing while another thread registers signatures must not see a dict change size.
+import threading as _threading
+_r_race = Router(models={"papers": "/tmp/laya-papers"}, signatures={"papers": [["a"]]})
+_race_errors = []
+_stop = _threading.Event()
+def _route_loop():
+    try:
+        while not _stop.is_set():
+            _r_race.match_signature({"zz": 1})
+    except Exception as _e:  # noqa: BLE001
+        _race_errors.append(_e)
+_t = _threading.Thread(target=_route_loop)
+_t.start()
+for _i in range(300):
+    _r_race.register("m%d" % _i, "/tmp/m%d" % _i, signatures=[["q%d" % _i]])
+_stop.set()
+_t.join()
+check("signature/match_signature survives a concurrent register", _race_errors, [])
+
+# R1-6: an attach()ed agent with no source is not part of a whole-router preload.
+with patch("laya.agent.Agent", side_effect=lambda repo, **kw: _Stub(repo)) as _build_att:
+    _r_att = Router()
+    _r_att.attach("mine", _Stub("mine"))
+    _r_att.unload("mine")
+    _r_att.preload()
+    check("preload/skips a name with no source", sorted(_r_att.loaded),
+          ["english", "multilingual", "typed-decisions"])
+
+# register(): the same thing after construction.
+r2 = Router()
+check("register/returns the canonical name", r2.register("Tone", "acme/laya-tone", signatures=[["mood"]]), "tone")
+check("register/routes by its signature", r2.route(_CLAIM, {"mood": _SECTION_Q["section"]}).model, "tone")
+check("register/a second call replaces the source", (r2.register("tone", "/tmp/tone-v2"), r2.models["tone"])[1], "/tmp/tone-v2")
+check("register/replacing the source keeps the signatures", r2.signatures["tone"], [Signature(["mood"])])
+check("register/the same signature twice is one entry",
+      (r2.register("tone", "/tmp/tone-v2", signatures=[["mood"]]), r2.signatures["tone"])[1], [Signature(["mood"])])
+check("register/a built-in name re-points that checkpoint",
+      Router(models={"english": "/tmp/my-english"}).models["english"], "/tmp/my-english")
+check("register/an alias re-points its built-in", Router(models={"en": "/tmp/mine"}).models["english"], "/tmp/mine")
+for bad, why in (("Bad/Name", "slash"), ("", "empty"), ("-dash", "leading dash"), ("a b", "space")):
+    try:
+        Router().register(bad, "/tmp/x")
+        check("register/refuses %s" % why, False, True)
+    except ValueError:
+        check("register/refuses %s" % why, True, True)
+try:
+    Router(models={"papers": "/x", "tone": "/y"}, signatures={"papers": [["q"]], "tone": [["q"]]})
+    check("register/one id set cannot select two checkpoints", False, True)
+except ValueError as e:
+    check("register/one id set cannot select two checkpoints", "'papers'" in str(e), True)
+try:
+    Router(models={"papers": "/x"}, signatures={"papers": [[]]})
+    check("register/an empty signature is refused", False, True)
+except ValueError:
+    check("register/an empty signature is refused", True, True)
+try:
+    Router(signatures={"papers": [["q"]]})
+    check("register/signatures for an unregistered name are refused", False, True)
+except ValueError:
+    check("register/signatures for an unregistered name are refused", True, True)
+try:
+    Router(models={"papers": "/x"}, signatures={"papers": "section"})
+    check("register/a bare string is not a list of sets", False, True)
+except TypeError:
+    check("register/a bare string is not a list of sets", True, True)
+try:
+    Router(models={"papers": 42})
+    check("register/a source must be a path, repo or pair", False, True)
+except TypeError:
+    check("register/a source must be a path, repo or pair", True, True)
+
+# Every name-taking option accepts a registered name, the way it accepts a built-in one.
+r3 = Router(models={"papers": "/tmp/laya-papers"}, revisions={"papers": "abc123"}, default="papers",
+            sha256_digests={"papers": {"model.safetensors": "a" * 64}})
+check("register/default may be a registered name", r3.default, "papers")
+check("register/revisions keyed by a registered name", r3.revisions, {"papers": "abc123"})
+check("register/sha256_digests keyed by a registered name", r3.sha256_digests["papers"], {"model.safetensors": "a" * 64})
+check("register/undecided text falls back to the registered default",
+      r3.route("Quero cancelar", {"q": _SECTION_Q["section"]}).model, "papers")
+_old_env = os.environ.get("LAYA_SHA256_DIGESTS")
+os.environ["LAYA_SHA256_DIGESTS"] = '{"papers": {"model.safetensors": "%s"}}' % ("b" * 64)
+try:
+    check("register/LAYA_SHA256_DIGESTS may name a registered checkpoint",
+          Router(models={"papers": "/tmp/laya-papers"}).sha256_digests["papers"], {"model.safetensors": "b" * 64})
+finally:
+    if _old_env is None:
+        os.environ.pop("LAYA_SHA256_DIGESTS", None)
+    else:
+        os.environ["LAYA_SHA256_DIGESTS"] = _old_env
+
+# attach() under a new name registers it with no source: resident now, not reloadable later.
+r4 = Router()
+r4.attach("adhoc", _Stub("adhoc"))
+check("attach/new name becomes resident", "adhoc" in r4.loaded, True)
+check("attach/new name is routable", r4.route(_CLAIM, _SECTION_Q, model="adhoc").model, "adhoc")
+check("attach/new name has no source", r4.models["adhoc"], None)
+r4.unload("adhoc")
+try:
+    r4.load("adhoc")
+    check("attach/reload without a source is refused", False, True)
+except ValueError as e:
+    check("attach/reload without a source is refused", "no source" in str(e), True)
+
+# load() hands a registered local path or repo to Agent as a source, not as a registry name.
+import laya.agent as _agent_for_registry
+_built = []
+
+
+class _RecordingAgent:
+    def __init__(self, repo, **kwargs):
+        _built.append((repo, kwargs.get("subfolder")))
+
+
+_prev_agent = _agent_for_registry.Agent
+_agent_for_registry.Agent = _RecordingAgent
+try:
+    r5 = Router(models={"papers": "/tmp/laya-papers", "tone": ("acme/laya-tone", "v2")}, max_loaded=3)
+    r5.load("papers")
+    r5.load("tone")
+    check("load/a registered path reaches Agent unchanged", _built[0], ("/tmp/laya-papers", None))
+    check("load/a registered (repo, subfolder) pair reaches Agent", _built[1], ("acme/laya-tone", "v2"))
+    check("load/registered checkpoints are resident like built-ins", r5.loaded, ["papers", "tone"])
+    r5.preload(["papers", "english"])
+    check("load/preload accepts registered names", "english" in r5.loaded and "papers" in r5.loaded, True)
+    r5.unload("papers")
+    check("load/unload accepts registered names", "papers" in r5.loaded, False)
+finally:
+    _agent_for_registry.Agent = _prev_agent
+
+
+# --------------------------------------------------------------------- pinned signatures
+# A signature may pin a question's instructions as well as its id, so two workflows that both ask
+# a `section` question are told apart by what they ask. The model never sees the id, only the
+# instructions and options, which is why the instructions are the stable part of a question kind.
+_ASK = "Which section of the brief does this claim belong to?"
+_ASK_REFLOWED = "  Which section   of the brief\ndoes this claim belong to?  "
+_OTHER_ASK = "Which rule of the style guide does this post break?"
+
+
+def _q(instructions, qid="section"):
+    return {qid: {"type": "choice", "instructions": instructions, "criteria": {"a": "A", "b": "B"}}}
+
+
+check("digest/prefix", instructions_digest(_ASK)[:5], "sha1:")
+check("digest/whitespace is collapsed", instructions_digest(_ASK_REFLOWED), instructions_digest(_ASK))
+check("digest/different text, different digest", instructions_digest(_OTHER_ASK) == instructions_digest(_ASK), False)
+check("digest/a digest passes through", instructions_digest(instructions_digest(_ASK)), instructions_digest(_ASK))
+check("digest/structured instructions are canonical JSON",
+      instructions_digest({"question": "q", "focus": "f"}), instructions_digest({"focus": "f", "question": "q"}))
+check("digest/None has no digest", instructions_digest(None), None)
+
+rp = Router(models={"research": "/tmp/r", "linkedin": "/tmp/l", "generic": "/tmp/g"},
+            signatures={"research": [{"section": _ASK}],
+                        "linkedin": [{"section": instructions_digest(_OTHER_ASK)}],
+                        "generic": [["section"]]})
+check("pinned/text pin routes the matching question", rp.route("claim", _q(_ASK)).model, "research")
+check("pinned/reflowed instructions still match", rp.route("claim", _q(_ASK_REFLOWED)).model, "research")
+check("pinned/a digest pin routes too", rp.route("post", _q(_OTHER_ASK)).model, "linkedin")
+check("pinned/same id, unknown instructions falls to the id-only signature",
+      rp.route("x", _q("Something else entirely?")).model, "generic")
+check("pinned/same id, no instructions falls to the id-only signature",
+      rp.route("x", {"section": {"type": "choice", "criteria": {"a": "A"}}}).model, "generic")
+check("pinned/a different id set matches nothing", rp.route("x", _q(_ASK, qid="sect")).model, "english")
+check("pinned/explicit model still wins", rp.route("x", _q(_ASK), model="generic").model, "generic")
+check("pinned/registered reports the digest",
+      rp.registered["research"]["signatures"], [{"ids": ["section"], "instructions": {"section": instructions_digest(_ASK)}}])
+check("pinned/registered reports an id-only signature as a list", rp.registered["generic"]["signatures"], [["section"]])
+check("pinned/Signature equality ignores pin order",
+      Signature(["a", "b"], {"a": "sha1:x", "b": "sha1:y"}) == Signature(["b", "a"], {"b": "sha1:y", "a": "sha1:x"}), True)
+
+# Without the id-only fallback, an unpinned question under a pinned id routes by language.
+rq = Router(models={"research": "/tmp/r"}, signatures={"research": [{"section": _ASK, "subsection": None}]})
+two = {**_q(_ASK), **_q("Which subsection?", qid="subsection")}
+check("pinned/a null pin leaves that question unconstrained", rq.route("claim", two).model, "research")
+check("pinned/the pinned question must still match",
+      rq.route("claim", {**_q(_OTHER_ASK), **_q("Which subsection?", qid="subsection")}).model, "english")
+check("pinned/partial id set does not match", rq.route("claim", _q(_ASK)).model, "english")
+
+# Conflicts: the same ids with the same pins cannot select two checkpoints; different pins may.
+try:
+    Router(models={"a": "/a", "b": "/b"}, signatures={"a": [{"section": _ASK}], "b": [{"section": _ASK}]})
+    check("pinned/identical pinned signatures on two checkpoints are refused", False, True)
+except ValueError as e:
+    check("pinned/identical pinned signatures on two checkpoints are refused", "already registered for 'a'" in str(e), True)
+try:
+    Router(models={"a": "/a", "b": "/b"}, signatures={"a": [{"section": _ASK}], "b": [{"section": _OTHER_ASK}]})
+    check("pinned/different pins on the same id are allowed", True, True)
+except ValueError:
+    check("pinned/different pins on the same id are allowed", False, True)
+try:
+    Router(models={"a": "/a", "b": "/b"}, signatures={"a": [{"section": _ASK}], "b": [["section"]]})
+    check("pinned/an id-only signature beside a pinned one is allowed", True, True)
+except ValueError:
+    check("pinned/an id-only signature beside a pinned one is allowed", False, True)
+for bad, why in (({"section": 7}, "non-text pin"), ({"section": ""}, "blank pin"), ({}, "empty mapping"), ({"": _ASK}, "blank id")):
+    try:
+        Router(models={"a": "/a"}, signatures={"a": [bad]})
+        check("pinned/refuses %s" % why, False, True)
+    except (TypeError, ValueError):
+        check("pinned/refuses %s" % why, True, True)
+check("pinned/register accepts the mapping form",
+      (Router().register("tone", "/t", signatures=[{"mood": _OTHER_ASK}]), True)[1], True)
+
+
+import hashlib  # noqa: E402
+
+# Nested pins: the signature with more pins is tried first; pins that neither contain nor contradict
+# each other cannot be told apart and are refused.
+_TWO = {**_q(_ASK), **_q(_OTHER_ASK, qid="title")}
+for order in (("a", "b"), ("b", "a")):
+    sigs = {"a": [{"section": _ASK, "title": None}], "b": [{"section": _ASK, "title": _OTHER_ASK}]}
+    rn = Router(models={"a": "/a", "b": "/b"}, signatures={k: sigs[k] for k in order})
+    check("pinned/the more specific signature wins in either order (%s)" % "".join(order),
+          rn.route("x", _TWO).model, "b")
+for first, second in (({"section": _ASK, "title": None}, {"section": None, "title": _OTHER_ASK}),
+                      ({"section": _ASK, "title": None}, {"section": _ASK, "title": None})):
+    try:
+        Router(models={"a": "/a", "b": "/b"}, signatures={"a": [first], "b": [second]})
+        check("pinned/indistinguishable pins on one id set are refused", False, True)
+    except ValueError as e:
+        check("pinned/indistinguishable pins on one id set are refused", "already registered for 'a'" in str(e), True)
+
+# The shape `registered` reports is accepted back, so it round-trips.
+rr = Router(models={"a": "/a"}, signatures={"a": [{"section": _ASK}, ["title"]]})
+rt = Router(models={"a": "/a"}, signatures={"a": rr.registered["a"]["signatures"]})
+check("pinned/registered round-trips into signatures", rt.registered["a"]["signatures"], rr.registered["a"]["signatures"])
+check("pinned/a round-tripped signature still routes", rt.route("x", _q(_ASK)).model, "a")
+try:
+    Router(models={"a": "/a"}, signatures={"a": [{"ids": ["section"], "instructions": {"other": _ASK}}]})
+    check("pinned/a reported shape pinning a foreign id is refused", False, True)
+except ValueError:
+    check("pinned/a reported shape pinning a foreign id is refused", True, True)
+
+# Digests: well-formed ones pass through (case-folded), malformed ones are refused up front.
+_HEX = instructions_digest(_ASK)
+check("digest/uppercase hex is normalised", instructions_digest("SHA1:" + _HEX[5:].upper()), _HEX)
+for bad in ("sha1:3f2a", "sha1:" + "g" * 40, "sha1:" + "0" * 41):
+    try:
+        Router(models={"a": "/a"}, signatures={"a": [{"section": bad}]})
+        check("digest/malformed pin %r is refused" % bad[:12], False, True)
+    except ValueError:
+        check("digest/malformed pin %r is refused" % bad[:12], True, True)
+check("digest/a request whose instructions look like a bad digest just does not match",
+      rp.route("x", _q("sha1:zz")).model, "generic")
+
+# Known digests are fixed: changing the normalisation would invalidate every digest stored in a manifest.
+check("digest/known text value", instructions_digest("Which section?"), "sha1:" + hashlib.sha1(b"Which section?").hexdigest())
+check("digest/known text digest literal", instructions_digest("Which  section?\n"),
+      "sha1:b65b4dbcfc4a7efd6cf009d0da00ceed3328efc9")
+check("digest/known structured value", instructions_digest({"b": 1, "a": "é"}),
+      "sha1:" + hashlib.sha1('{"a": "é", "b": 1}'.encode("utf-8")).hexdigest())
+
+
+# Signature objects and the described shape get the same checks as the mapping form.
+_d = instructions_digest(_ASK)
+_r = Router(models={"a": "/tmp/a"}, signatures={"a": [Signature(["section"], {"section": _ASK})]})
+check("pinned/Signature text pin is hashed", _r.registered["a"]["signatures"],
+      [{"ids": ["section"], "instructions": {"section": _d}}])
+check("pinned/Signature text pin routes", _r.route("x", _q(_ASK)).model, "a")
+_r = Router(models={"a": "/tmp/a"}, signatures={"a": [Signature(["section"], {"section": _d.upper().replace("SHA1", "sha1")})]})
+check("pinned/Signature uppercase digest normalised", _r.route("x", _q(_ASK)).model, "a")
+for _bad, _why in ((Signature(["section"], {"title": _d}), "foreign pin"),
+                   (Signature(["section"], {"section": ""}), "blank pin"),
+                   (Signature(["section"], {"section": "sha1:3f2a"}), "malformed digest")):
+    try:
+        Router(models={"a": "/tmp/a"}, signatures={"a": [_bad]})
+        check("pinned/Signature %s refused" % _why, False, True)
+    except (ValueError, TypeError):
+        check("pinned/Signature %s refused" % _why, True, True)
+for _bad, _why in (({"ids": [1, 2], "instructions": {}}, "non-text ids"),
+                   ({"ids": ["m", None], "instructions": {}}, "null id"),
+                   ({"ids": ["m"], "instructions": {"m": ""}}, "blank pin"),
+                   ({"ids": ["m"], "instructions": {"m": 7}}, "non-text pin")):
+    try:
+        Router(models={"a": "/tmp/a"}, signatures={"a": [_bad]})
+        check("pinned/described %s refused" % _why, False, True)
+    except (ValueError, TypeError):
+        check("pinned/described %s refused" % _why, True, True)
+_same = Router(models={"a": "/tmp/a"}, signatures={"a": [{"section": _ASK, "title": None},
+                                                         {"section": None, "title": _OTHER_ASK}]})
+check("pinned/non-nested pins on one checkpoint are accepted", len(_same.signatures["a"]), 2)
+_at = Router(models={"b": "/b"}, signatures={"b": [{"section": None, "title": "Y"}]})
+try:
+    _at.register("c", "/c", signatures=[["mood"], {"section": "X", "title": None}], description="tone")
+    _at_raised = False
+except ValueError:
+    _at_raised = True
+check("register/refused call raises", _at_raised, True)
+check("register/refused call leaves no checkpoint", "c" in _at.models or "c" in _at.signatures, False)
+_at2 = Router(models={"a": "/a", "b": "/b"}, signatures={"b": [["t"]]})
+try:
+    _at2.register("a", "/new", signatures=[["t"]])
+except ValueError:
+    pass
+check("register/refused call keeps the old source", _at2.registered["a"]["source"], "/a")
+
+# An explicit `sha256_digests[name] = None` is a present entry that opts that checkpoint out of
+# digest checks; a refused register() must restore it, not drop it (dropping it would hand the
+# checkpoint back to the environment's digest map).
+_at3 = Router(models={"a": "/a", "b": "/b"}, sha256_digests={"a": None}, signatures={"b": [["t"]]})
+try:
+    _at3.register("a", "/a2", signatures=[["t"]])
+    check("register/refused call raises on a taken signature", False, True)
+except ValueError:
+    check("register/refused call raises on a taken signature", True, True)
+check("register/refused call keeps an opted-out digest entry", ("a" in _at3.sha256_digests, _at3.sha256_digests.get("a", "gone")),
+      (True, None))
+check("register/refused call keeps the old source after a digest opt-out", _at3.models["a"], "/a")
+# register(signatures=...) on a registered name replaces its signatures; unregister() removes a name.
+_rp = Router(models={"a": "/a", "b": "/b"}, signatures={"a": [["t"]], "b": [["u"]]})
+_rp.register("a", "/a", signatures=[["v"]])
+check("register/signatures replace the earlier ones", [sig.describe() for sig in _rp.signatures["a"]], [["v"]])
+check("register/a replaced signature no longer routes", _rp.match_signature({"t": {}}), None)
+check("register/a replacement routes", _rp.match_signature({"v": {}}), ("a", "a"))
+_rp.register("a", "/a2")
+check("register/no signatures argument keeps them", [sig.describe() for sig in _rp.signatures["a"]], [["v"]])
+try:
+    _rp.register("a", "/a", signatures=[["u"]])
+    check("register/replacement still refuses another checkpoint's signature", False, True)
+except ValueError:
+    check("register/replacement still refuses another checkpoint's signature", True, True)
+check("register/a refused replacement keeps the old signatures", [sig.describe() for sig in _rp.signatures["a"]], [["v"]])
+_rp.descriptions["a"] = "A"
+_rp.sha256_digests["a"] = None
+_rp.revisions["a"] = "main"
+_rp.attach("a", object())
+_rp.unregister("a")
+check("unregister/removes the name everywhere",
+      ("a" in _rp.models, "a" in _rp.signatures, "a" in _rp.descriptions, "a" in _rp.sha256_digests,
+       "a" in _rp.revisions, "a" in _rp.loaded, "a" in _rp.registered), (False,) * 7)
+check("unregister/its signature is free again", _rp.match_signature({"v": {}}), None)
+check("unregister/others are untouched", sorted(_rp.registered), ["b"])
+for _bad in ("english", "ml", "never-registered"):
+    try:
+        _rp.unregister(_bad)
+        check("unregister/%s refused" % _bad, False, True)
+    except ValueError:
+        check("unregister/%s refused" % _bad, True, True)
+_rp.register("a", "/a", signatures=[["v"]])
+check("unregister/the name can be registered again", _rp.match_signature({"v": {}}), ("a", "a"))
+
+# Routing while another thread re-registers and unregisters never fails or answers from a torn state.
+_rc = Router(models={"a": "/a"}, signatures={"a": [["t"]]})
+_stop = threading.Event()
+_bad = []
+
+
+def _churn():
+    while not _stop.is_set():
+        _rc.register("a", "/a", signatures=[["t"]])
+        _rc.register("c", "/c", signatures=[["u"]])
+        _rc.unregister("c")
+
+
+def _route():
+    for _ in range(2000):
+        try:
+            _got = _rc.match_signature({"t": {}})
+            if _got != ("a", "a"):
+                _bad.append(_got)
+            _rc.registered
+        except Exception as exc:  # noqa: BLE001
+            _bad.append(exc)
+
+
+_th = [threading.Thread(target=_churn)] + [threading.Thread(target=_route) for _ in range(3)]
+for _t in _th:
+    _t.start()
+for _t in _th[1:]:
+    _t.join()
+_stop.set()
+_th[0].join()
+check("register+unregister while routing stay consistent", _bad[:3], [])
+
+
+def _test_unregister_during_build_leaves_no_zombie():
+    """A load that starts right after unregister's unload must not leave an agent under the dropped name."""
+    import laya.agent as _agent_mod
+    started, release = threading.Event(), threading.Event()
+
+    class _Slow:
+        def __init__(self, *args, **kwargs):
+            started.set()
+            release.wait(5)
+
+    old = _agent_mod.Agent
+    _agent_mod.Agent = _Slow
+    try:
+        r = Router(models={"tone": "/tone"})
+        loaders = []
+
+        def _then_load(real):
+            def hooked(*args):
+                out = real(*args)
+                if not loaders:     # the instant after the unload: a request starts loading the name
+                    loaders.append(threading.Thread(target=_swallow, args=(r.load, "tone"), daemon=True))
+                    loaders[0].start()
+                    started.wait(1)
+                return out
+            return hooked
+
+        for _hook in ("unload", "_unload_key"):     # whichever step frees the resident agent
+            if hasattr(r, _hook):
+                setattr(r, _hook, _then_load(getattr(r, _hook)))
+        _timer = threading.Timer(0.3, release.set)
+        _timer.start()
+        r.unregister("tone")
+        for _loader in loaders:
+            _loader.join(5)
+        release.set()
+        _timer.cancel()
+        r.register("tone", "/other")
+        return ("tone" in r.loaded, "tone" in r._agents)
+    finally:
+        release.set()
+        _agent_mod.Agent = old
+
+
+def _swallow(fn, *args):
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+check("unregister/a build in flight leaves no resident agent behind",
+      _test_unregister_during_build_leaves_no_zombie(), (False, False))
+
+def _test_unregister_drops_signatures_with_the_model():
+    """While unregister waits for an in-flight build, no request may match the name into a missing model."""
+    import laya.agent as _agent_mod
+    started, release = threading.Event(), threading.Event()
+
+    class _Slow:
+        def __init__(self, *args, **kwargs):
+            started.set()
+            release.wait(5)
+
+    old = _agent_mod.Agent
+    _agent_mod.Agent = _Slow
+    try:
+        r = Router(models={"tone": "/tone"}, signatures={"tone": [["section"]]})
+        loader = threading.Thread(target=_swallow, args=(r.load, "tone"), daemon=True)
+        loader.start()
+        started.wait(2)
+        remover = threading.Thread(target=_swallow, args=(r.unregister, "tone"), daemon=True)
+        remover.start()
+        _time.sleep(0.2)     # unregister is now waiting for the build
+        try:
+            out = ("tone" in r.models, "tone" in r.signatures, r.match_signature({"section": {}}))
+        finally:
+            release.set()
+            loader.join(5)
+            remover.join(5)
+        return out
+    finally:
+        release.set()
+        _agent_mod.Agent = old
+
+
+check("unregister/signatures leave with the model while a build is in flight",
+      _test_unregister_drops_signatures_with_the_model(), (False, False, None))
+
+def _test_unregister_between_match_and_route():
+    r = Router(models={"tone": "/fake/tone"}, signatures={"tone": [["section"]]})
+    real = r.match_signature
+
+    def _match_then_unregister(*args, **kwargs):
+        out = real(*args, **kwargs)
+        r.unregister("tone")        # lands between the match and the route
+        return out
+
+    r.match_signature = _match_then_unregister
+    try:
+        return r.route("hello there", questions={"section": {"type": "choice", "choices": ["a", "b"]}}).model
+    except KeyError:
+        return "KeyError"
+
+
+check("route/an unregister between the signature match and the route falls back to language routing",
+      _test_unregister_between_match_and_route(), "english")
+
+def _test_unregister_right_after_the_models_read():
+    class _Models(dict):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.owner = None
+
+        def __contains__(self, key):
+            out = super().__contains__(key)
+            self._drop(key)
+            return out
+
+        def get(self, key, default=None):
+            out = super().get(key, default)
+            self._drop(key)
+            return out
+
+        def __getitem__(self, key):
+            out = super().__getitem__(key)
+            self._drop(key)
+            return out
+
+        def _drop(self, key):
+            if self.owner is not None and key == "tone":
+                owner, self.owner = self.owner, None
+                owner.unregister("tone")     # lands right after the first read of the entry
+
+    r = Router(models={"tone": "/fake/tone"}, signatures={"tone": [["section"]]})
+    r.models = _Models(r.models)
+    r.models.owner = r
+    try:
+        return r.route("hello there", questions={"section": {"type": "choice", "choices": ["a", "b"]}}).model
+    except KeyError:
+        return "KeyError"
+
+
+check("route/an unregister right after the models read cannot raise KeyError",
+      _test_unregister_right_after_the_models_read(), "tone")
+
+
+def _test_sourceless_signature_still_routes():
+    class _Fake:
+        pass
+    r = Router(models={"tone": None}, signatures={"tone": [["section"]]})
+    r.attach("tone", _Fake())
+    return r.route("hello there", questions={"section": {"type": "choice", "choices": ["a", "b"]}}).model
+
+
+check("route/a signature registered for a sourceless resident checkpoint still routes to it",
+      _test_sourceless_signature_still_routes(), "tone")
+
+try:
+    Signature("section")
+    _bare = False
+except TypeError:
+    _bare = True
+check("Signature/bare string ids refused", _bare, True)
+
+# --------------------------------------------------------------------- option pins and purpose
+# A signature may also pin the answer set: the sorted labels of a choice question, or the level
+# count of a score question. Labels, not descriptions, so rewording a description keeps the
+# checkpoint valid and adding or removing a label does not. `for` is documentation only.
+from laya.router import options_key, parse_signature  # noqa: E402
+
+_SCREEN = "Read or skip this reference?"
+def _choice(labels, qid="screen", instructions=_SCREEN):
+    return {qid: {"type": "choice", "instructions": instructions, "criteria": {k: "about " + k for k in labels}}}
+def _score(levels, qid="urgency"):
+    return {qid: {"type": "score", "instructions": "How urgent?", "criteria": list(levels)}}
+
+check("options_key/choice gives sorted labels", options_key(_choice(["skip", "read"])["screen"]), ["read", "skip"])
+check("options_key/score gives the level count", options_key(_score(["calm", "firm", "angry"])["urgency"]), 3)
+check("options_key/noul has nothing to pin", options_key({"type": "noul", "instructions": "x"}), None)
+check("options_key/not a question", options_key("nope"), None)
+check("options_key/list-form choice gives sorted labels",
+      options_key({"type": "choice", "criteria": ["b", "a", "c"]}), ["a", "b", "c"])
+check("options_key/noul with criteria has nothing to pin",
+      options_key({"type": "noul", "criteria": {"true": "", "false": ""}}), None)
+_rl = Router(models={"tri": "/t", "scr": "/s"},
+             signatures={"tri": [{"ids": ["q"], "options": {"q": ["a", "b", "c"]}}],
+                         "scr": [{"ids": ["q"], "options": {"q": 3}}]})
+check("options pin/list-form choice with other labels is not a score",
+      _rl.match_signature({"q": {"type": "choice", "instructions": "x", "criteria": ["x", "y", "z"]}}), None)
+check("options pin/list-form choice reaches the label pin",
+      _rl.match_signature({"q": {"type": "choice", "instructions": "x", "criteria": ["c", "a", "b"]}}), ("tri", "tri"))
+check("options pin/score still matches the count",
+      _rl.match_signature({"q": {"type": "score", "instructions": "x", "criteria": ["x", "y", "z"]}}), ("scr", "scr"))
+for _bad in ({"ids": ["section"], "options": {"section": ["a", "b"]}, "purpose": "x"},
+             {"ids": "section", "options": {"section": ["a", "b"]}},
+             {"ids": ["section"], "options": None}, {"ids": ["section"], "instructions": None}):
+    try:
+        parse_signature("k", _bad)
+        _ok = False
+    except (TypeError, ValueError):
+        _ok = True
+    check("parse_signature refuses a malformed faceted object %r" % (_bad,), _ok, True)
+
+ro = Router(models={"screen": "/s", "triage": "/t", "open": "/o"},
+            signatures={"screen": [{"ids": ["screen"], "instructions": {"screen": _SCREEN},
+                                    "options": {"screen": ["read", "skip"]}, "for": "read or skip a reference"}],
+                        "triage": [{"ids": ["urgency"], "options": {"urgency": 3}}],
+                        "open": [["section"]]})
+check("options/matching labels route", ro.route("x", _choice(["skip", "read"])).model, "screen")
+check("options/descriptions may change", ro.route("x", {"screen": {**_choice(["read", "skip"])["screen"], "criteria": {"read": "worth it", "skip": "not"}}}).model, "screen")
+check("options/an added label is no match", ro.route("x", _choice(["read", "skip", "maybe"])).model, "english")
+check("options/a removed label is no match", ro.route("x", _choice(["read"])).model, "english")
+check("options/a wrong instructions text is no match", ro.route("x", _choice(["read", "skip"], instructions="Keep it?")).model, "english")
+check("options/score level count matches", ro.route("x", _score(["a", "b", "c"])).model, "triage")
+check("options/score level count mismatch", ro.route("x", _score(["a", "b"])).model, "english")
+check("options/noul under a pinned id is no match", ro.route("x", {"urgency": {"type": "noul", "instructions": "Urgent?"}}).model, "english")
+check("options/registered reports all facets", ro.registered["screen"]["signatures"],
+      [{"ids": ["screen"], "instructions": {"screen": instructions_digest(_SCREEN)},
+        "options": {"screen": ["read", "skip"]}, "for": "read or skip a reference"}])
+check("options/registered reports options alone", ro.registered["triage"]["signatures"], [{"ids": ["urgency"], "options": {"urgency": 3}}])
+check("options/registered keeps the list form for id-only", ro.registered["open"]["signatures"], [["section"]])
+_rt = Router(models={"screen": "/s"}, signatures={"screen": ro.registered["screen"]["signatures"]})
+check("options/the reported shape round-trips", _rt.registered["screen"]["signatures"], ro.registered["screen"]["signatures"])
+check("options/purpose takes no part in equality",
+      Signature(["a"], options={"a": ["x"]}, purpose="one") == Signature(["a"], options={"a": ["x"]}, purpose="two"), True)
+check("options/order of labels does not matter", Signature(["a"], options={"a": ["y", "x"]}) == Signature(["a"], options={"a": ["x", "y"]}), True)
+
+# Specificity and conflicts across facets.
+rs = Router(models={"a": "/a", "b": "/b"},
+            signatures={"a": [{"ids": ["screen"], "instructions": {"screen": _SCREEN}}],
+                        "b": [{"ids": ["screen"], "instructions": {"screen": _SCREEN}, "options": {"screen": ["read", "skip"]}}]})
+check("options/the signature with more facets wins", rs.route("x", _choice(["read", "skip"])).model, "b")
+check("options/the less specific one takes the rest", rs.route("x", _choice(["read", "skip", "maybe"])).model, "a")
+try:
+    Router(models={"a": "/a", "b": "/b"},
+           signatures={"a": [{"ids": ["screen"], "options": {"screen": ["read", "skip"]}}],
+                       "b": [{"ids": ["screen"], "instructions": {"screen": _SCREEN}}]})
+    check("options/disjoint facets on two checkpoints are refused", False, True)
+except ValueError:
+    check("options/disjoint facets on two checkpoints are refused", True, True)
+try:
+    Router(models={"a": "/a", "b": "/b"},
+           signatures={"a": [{"ids": ["screen"], "options": {"screen": ["read", "skip"]}}],
+                       "b": [{"ids": ["screen"], "options": {"screen": ["keep", "drop"]}}]})
+    check("options/different option sets on two checkpoints are allowed", True, True)
+except ValueError:
+    check("options/different option sets on two checkpoints are allowed", False, True)
+for bad, why in (({"ids": ["screen"], "options": {"screen": "read"}}, "a bare string"),
+                 ({"ids": ["screen"], "options": {"screen": []}}, "an empty label list"),
+                 ({"ids": ["screen"], "options": {"screen": ["read", "read"]}}, "a duplicate label"),
+                 ({"ids": ["screen"], "options": {"screen": 0}}, "a zero level count"),
+                 ({"ids": ["screen"], "options": {"screen": True}}, "a boolean"),
+                 ({"ids": ["screen"], "options": {"other": ["a"]}}, "a pin outside the ids"),
+                 ({"ids": ["screen"], "for": ""}, "a blank purpose"),
+                 ({"ids": ["screen"], "extra": 1}, "an unknown facet")):
+    try:
+        Router(models={"a": "/a"}, signatures={"a": [bad]})
+        check("options/refuses %s" % why, False, True)
+    except (TypeError, ValueError):
+        check("options/refuses %s" % why, True, True)
+for _p in ("", "  ", 5):
+    try:
+        Router(models={"a": "/a"}, signatures={"a": [Signature(["q"], purpose=_p)]})
+        check("options/Signature object with purpose %r is refused like the faceted form" % (_p,), False, True)
+    except TypeError:
+        check("options/Signature object with purpose %r is refused like the faceted form" % (_p,), True, True)
+check("parse_signature/module-level form agrees with the Router's",
+      parse_signature("a", {"ids": ["screen"], "options": {"screen": ["skip", "read"]}}) == Router._parse_signature("a", {"ids": ["screen"], "options": {"screen": ["read", "skip"]}}), True)
+
+
 # --------------------------------------------------------------------- report
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
