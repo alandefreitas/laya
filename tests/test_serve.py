@@ -74,6 +74,12 @@ class BudgetRouter(FakeRouter):
         return out
 
 
+@pytest.fixture(autouse=True)
+def _own_store(monkeypatch, tmp_path):
+    """Every test reads an empty store unless it sets its own: never the developer's checkpoints."""
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path / "empty-store"))
+
+
 def _client(monkeypatch, api_key=None):
     if api_key is None:
         monkeypatch.delenv("LAYA_API_KEY", raising=False)
@@ -471,7 +477,7 @@ print("ok")
     assert "ok" in out.stdout, out.stdout
 
 
-def test_build_router_strips_the_device_before_torch_sees_it(monkeypatch):
+def test_build_router_strips_the_device_before_torch_sees_it(monkeypatch, tmp_path):
     """A value pasted from a Dockerfile or a `.env` file carries a trailing newline."""
     import laya.router
     import laya.serve
@@ -486,6 +492,7 @@ def test_build_router_strips_the_device_before_torch_sees_it(monkeypatch):
             seen["preloaded"] = names
 
     monkeypatch.setattr(laya.router, "Router", RecordingRouter)
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))     # not the developer's own store
     monkeypatch.setenv("LAYA_PRELOAD", "0")
     for raw, want in ((" cpu\n", "cpu"), ("cuda ", "cuda"), ("   ", None), ("cpu", "cpu")):
         monkeypatch.setenv("LAYA_DEVICE", raw)
@@ -3227,3 +3234,548 @@ def test_idle_unload_retries_failure_and_stops_at_shutdown(monkeypatch):
     router.loaded = ["english"]
     router.unloaded.clear()
     assert not router.unloaded.wait(0.15)
+
+
+# --------------------------------------------------------------------- registered checkpoints
+# A deployment's own checkpoints (LAYA_CHECKPOINTS_DIR) are served beside the built-ins: the model
+# field reaches them, /health lists them, and the server builds the registry from the store.
+_SECTION_Q = {"section": {"type": "choice", "instructions": "Which section?", "criteria": {"a": "A", "b": "B"}}}
+
+
+def _store_with_research(root, **manifest):
+    path = os.path.join(root, "research")
+    os.makedirs(path)
+    open(os.path.join(path, "model.safetensors"), "wb").close()
+    json.dump({"max_len": 1024}, open(os.path.join(path, "rl_agent_config.json"), "w"))
+    body = {"description": "Files claims into a brief", "signatures": [["section"]]}
+    body.update(manifest)
+    json.dump(body, open(os.path.join(path, "checkpoint.json"), "w"))
+    return path
+
+
+def test_resolve_model_asks_the_router_for_registered_names():
+    from laya.router import Router
+
+    router = Router(models={"research": "/tmp/laya-research"})
+    assert _resolve_model("research", router) == "research"
+    assert _resolve_model(" RESEARCH ", router) == "research"
+    assert _resolve_model("ml", router) == "multilingual"
+    assert _resolve_model("convaiinnovations/laya-multilingual", router) == "multilingual"
+    assert _resolve_model("jev-1", router) is None           # the Jev contract: unknown means auto-route
+    # A router with no resolve() of its own (the fakes above) still gets core's built-in table.
+    assert _resolve_model("research", FakeRouter()) is None
+    assert _resolve_model("multilingual", FakeRouter()) == "multilingual"
+
+
+def test_registered_model_reaches_predict(monkeypatch):
+    class RegistryRouter(FakeRouter):
+        def resolve(self, name):
+            key = str(name).strip().lower()
+            if key in ("research", "english"):
+                return key
+            raise ValueError("unknown model %r" % name)
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    fake = RegistryRouter()
+    client = TestClient(create_app(router=fake))
+    r = client.post("/v1/systemone", json={**REQ, "model": "Research"})
+    assert r.status_code == 200, r.text
+    assert fake.calls[-1]["model"] == "research"
+    r = client.post("/v1/systemone", json={**REQ, "model": "jev-1"})
+    assert r.status_code == 200, r.text
+    assert fake.calls[-1]["model"] is None
+
+
+def test_health_lists_registered_checkpoints(monkeypatch):
+    from laya.router import Router
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    router = Router(models={"research": "/tmp/laya-research", "tone": ("acme/laya-tone", "v2")},
+                    signatures={"research": [["section"], ["subsection", "section"]]})
+    router.descriptions["research"] = "Files claims into a brief"
+    body = TestClient(create_app(router=router)).get("/health").json()
+    assert body["loaded"] == []
+    assert body["registered"] == {
+        "research": {"source": "/tmp/laya-research", "signatures": [["section"], ["section", "subsection"]],
+                     "description": "Files claims into a brief"},
+        "tone": {"source": "acme/laya-tone/v2", "signatures": [], "description": None},
+    }
+    # A stock router, and a fake with no registry, both report an empty map rather than omitting it.
+    assert TestClient(create_app(router=Router())).get("/health").json()["registered"] == {}
+    assert TestClient(create_app(router=FakeRouter())).get("/health").json()["registered"] == {}
+
+
+def test_build_router_registers_the_store(monkeypatch, tmp_path):
+    from laya.serve import build_router
+
+    path = _store_with_research(str(tmp_path))
+    for name in ("LAYA_MODELS", "LAYA_DEFAULT_MODEL", "LAYA_DEVICE", "LAYA_MAX_LOADED", "LAYA_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    router = build_router()
+    assert router.loaded == []                                  # nothing built: preload is off
+    assert router.models["research"] == path
+    assert [sig.describe() for sig in router.signatures["research"]] == [["section"]]
+    assert router.descriptions["research"] == "Files claims into a brief"
+    assert router.route("A claim about transparency.", _SECTION_Q).model == "research"
+    assert router.route("A claim about transparency.", {"q": _SECTION_Q["section"]}).model == "english"
+    assert router.registered["research"]["signatures"] == [["section"]]
+
+    # The default may name a store entry, since the store is read before the default is resolved.
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "research")
+    assert build_router().default == "research"
+    monkeypatch.delenv("LAYA_DEFAULT_MODEL")
+
+    # An empty or missing store is the stock router.
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path / "missing"))
+    assert build_router().registered == {}
+
+
+def _stub_router(monkeypatch, tmp_path, **env):
+    """`build_router()` over `tmp_path` as the store, with `Agent` replaced by a recording stub.
+
+    Returns `(router, built)`: `built` lists the sources the stub was constructed from, so a test
+    can see a checkpoint load, unload and load again without any weights.
+    """
+    import laya.agent as agent_module
+    from laya.serve import build_router
+
+    built = []
+
+    class StubAgent:
+        def __init__(self, repo, **kwargs):
+            built.append(repo)
+
+        def system_one(self, state, questions, **kwargs):
+            return {"model": "laya-rl-agent", "answers": {}, "usage": {"input_tokens": 1, "output_tokens": 0}}
+
+    monkeypatch.setattr(agent_module, "Agent", StubAgent)
+    for name in ("LAYA_MODELS", "LAYA_DEFAULT_MODEL", "LAYA_DEVICE", "LAYA_MAX_LOADED", "LAYA_THREADS",
+                 "LAYA_API_KEY", "LAYA_IDLE_UNLOAD_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return build_router(), built
+
+
+def _write_checkpoint(root, name, **manifest):
+    path = os.path.join(str(root), name)
+    os.makedirs(path, exist_ok=True)
+    open(os.path.join(path, "model.safetensors"), "wb").close()
+    json.dump(manifest, open(os.path.join(path, "checkpoint.json"), "w"))
+    return path
+
+
+def test_a_directory_without_a_manifest_is_not_registered(monkeypatch, tmp_path):
+    path = os.path.join(str(tmp_path), "research")
+    os.makedirs(path)
+    open(os.path.join(path, "model.safetensors"), "wb").close()     # an export still being written
+    router, _ = _stub_router(monkeypatch, tmp_path)
+    assert router.registered == {}
+    body = TestClient(create_app(router=router)).get("/health").json()
+    assert "no manifest" in body["registered_errors"]["research"]
+    json.dump({}, open(os.path.join(path, "checkpoint.json"), "w"))     # the manifest completes it
+    body = TestClient(create_app(router=_stub_router(monkeypatch, tmp_path)[0])).get("/health").json()
+    assert list(body["registered"]) == ["research"] and body["registered_errors"] == {}
+
+
+def test_one_bad_checkpoint_does_not_stop_the_server(monkeypatch, tmp_path, caplog):
+    """C-2: a duplicate signature skips that checkpoint; the built-ins and the good ones keep serving."""
+    _write_checkpoint(tmp_path, "research", signatures=[["section"]])
+    _write_checkpoint(tmp_path, "two", signatures=[["section"]])      # sorts second: the loser
+    _write_checkpoint(tmp_path, "tone", signatures=[["mood"]])
+    _write_checkpoint(tmp_path, "broken-json")
+    open(os.path.join(str(tmp_path), "broken-json", "checkpoint.json"), "w").write("{not json")
+    with caplog.at_level(logging.ERROR, logger="laya.serve"):
+        router, _ = _stub_router(monkeypatch, tmp_path)
+    assert sorted(router.registered) == ["research", "tone"]
+    assert sorted(router.models) == ["english", "multilingual", "research", "tone", "typed-decisions"]
+    assert "skipped two" in caplog.text and "skipped broken-json" in caplog.text
+    body = TestClient(create_app(router=router)).get("/health").json()
+    assert sorted(body["registered_errors"]) == ["broken-json", "two"]
+    assert "already registered" in body["registered_errors"]["two"]
+    assert "cannot read" in body["registered_errors"]["broken-json"]
+    assert router.route("claim", _SECTION_Q).model == "research"      # the survivors still route
+
+
+def test_startup_still_refuses_what_is_explicit_configuration(monkeypatch, tmp_path):
+    from laya.serve import build_router
+
+    _write_checkpoint(tmp_path, "research", signatures=[["section"]])
+    _write_checkpoint(tmp_path, "two", signatures=[["section"]])
+    with pytest.raises(SystemExit) as exc:      # LAYA_DEFAULT_MODEL names the skipped checkpoint
+        _stub_router(monkeypatch, tmp_path, LAYA_DEFAULT_MODEL="two")
+    assert "two" in str(exc.value) and "skipped" in str(exc.value) and "already registered" in str(exc.value)
+    store = tmp_path / "unlistable"
+    _write_checkpoint(store, "research")
+    os.chmod(store, 0)
+    try:
+        if not os.access(store, os.R_OK):
+            monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(store))
+            with pytest.raises(SystemExit) as exc:      # the store itself cannot be listed
+                build_router()
+            assert "cannot list" in str(exc.value)
+    finally:
+        os.chmod(store, 0o755)
+
+
+def test_health_reports_the_version(monkeypatch):
+    import laya
+    from importlib import metadata
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    body = TestClient(create_app(router=FakeRouter())).get("/health").json()
+    assert body["version"] == laya.__version__ and body["registered_errors"] == {}
+    from laya import serve
+    monkeypatch.setattr(metadata, "version", lambda name: "0.0.1")      # a stale editable-install dist-info
+    assert serve._laya_version() == laya.__version__ == TestClient(create_app(router=FakeRouter())).get(
+        "/health").json()["version"]
+
+
+def test_unknown_model_is_visible_in_the_routing_reason(monkeypatch, caplog):
+    """C-3: the Jev contract stands (HTTP 200, auto-routed), but the miss is named in routing.reason."""
+    from laya import serve
+
+    serve._UNKNOWN_MODELS_LOGGED.clear()
+    client, fake = _client(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="laya.serve"):
+        r = client.post("/v1/systemone", json={**REQ, "model": "reserch"})
+        assert r.status_code == 200, r.text
+        assert r.json()["routing"]["reason"] == "unknown model reserch; English Latin text"
+        assert fake.calls[-1]["model"] is None
+        client.post("/v1/systemone", json={**REQ, "model": "reserch"})
+        batch = client.post("/v1/systemone/batch", json={"model": "reserch", "states": [REQ["state"], REQ["state"]],
+                                                         "questions": REQ["questions"]})
+        assert batch.status_code == 200, batch.text
+        assert [x["routing"]["reason"] for x in batch.json()["results"]] == [
+            "unknown model reserch; English Latin text"] * 2
+        client.post("/v1/systemone", json={**REQ, "model": "other-typo"})
+    logged = [rec.getMessage() for rec in caplog.records if "unknown model" in rec.getMessage()]
+    assert len(logged) == 2 and "reserch" in logged[0] and "other-typo" in logged[1]   # once per distinct name
+    for fine in ("english", "ml", "convaiinnovations/laya", "auto", "", "   ", None):
+        body = {**REQ}
+        body["model"] = fine
+        assert client.post("/v1/systemone", json=body).json()["routing"]["reason"] == "English Latin text", fine
+
+
+def test_unknown_model_log_does_not_grow_without_bound(monkeypatch):
+    from laya import serve
+
+    serve._UNKNOWN_MODELS_LOGGED.clear()
+    for i in range(serve._UNKNOWN_MODELS_LOGGED_MAX + 50):
+        serve._unknown_model_name("typo-%d" % i, None)
+    assert len(serve._UNKNOWN_MODELS_LOGGED) == serve._UNKNOWN_MODELS_LOGGED_MAX
+
+
+# --------------------------------------------------------------------- POST /reload
+def test_reload_registers_replaces_and_unregisters(monkeypatch, tmp_path):
+    """C-4: new checkpoints appear, changed ones are replaced (not appended), removed ones go; built-ins stay."""
+    import shutil
+
+    _write_checkpoint(tmp_path, "research", signatures=[["section"]], description="v1")
+    router, built = _stub_router(monkeypatch, tmp_path)
+    client = TestClient(create_app(router=router))
+    assert client.post("/reload").json() == {
+        "registered": router.registered, "registered_errors": {}, "added": [], "updated": [], "removed": []}
+
+    _write_checkpoint(tmp_path, "tone", signatures=[["mood"]], description="Tone")
+    body = client.post("/reload").json()
+    assert (body["added"], body["updated"], body["removed"]) == (["tone"], [], [])
+    assert sorted(body["registered"]) == ["research", "tone"]
+    assert body["registered"]["tone"]["description"] == "Tone"
+    assert client.get("/health").json()["registered"] == body["registered"]
+    assert client.post("/v1/systemone", json={"state": "x", "questions": {"mood": _SECTION_Q["section"]}}
+                       ).json()["routing"]["model"] == "tone"
+
+    # A changed manifest replaces the signatures and the description; the old signature stops routing.
+    _write_checkpoint(tmp_path, "research", signatures=[["screen"]])
+    body = client.post("/reload").json()
+    assert body["updated"] == ["research"]
+    assert body["registered"]["research"]["signatures"] == [["screen"]]
+    assert body["registered"]["research"]["description"] is None
+    assert router.route("x", _SECTION_Q).model == "english"
+    assert router.route("x", {"screen": _SECTION_Q["section"]}).model == "research"
+
+    # A changed source unloads the resident Agent so the next request builds the new one.
+    router.load("research")
+    assert "research" in router.loaded
+    _write_checkpoint(tmp_path, "research", signatures=[["screen"]], source="acme/laya-research")
+    assert client.post("/reload").json()["updated"] == ["research"]
+    assert "research" not in router.loaded and router.registered["research"]["source"] == "acme/laya-research"
+
+    # A removed directory is unregistered, and unloaded when resident.
+    router.load("tone")
+    shutil.rmtree(tmp_path / "tone")
+    body = client.post("/reload").json()
+    assert body["removed"] == ["tone"] and sorted(body["registered"]) == ["research"]
+    assert "tone" not in router.loaded and "tone" not in router.models
+    assert sorted(router.models) == ["english", "multilingual", "research", "typed-decisions"]
+    assert router.route("x", {"mood": _SECTION_Q["section"]}).model == "english"
+
+
+def test_reload_reports_errors_and_moves_signatures_between_checkpoints(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path, "a", signatures=[["x"]])
+    _write_checkpoint(tmp_path, "b", signatures=[["y"]])
+    router, _ = _stub_router(monkeypatch, tmp_path)
+    client = TestClient(create_app(router=router))
+    _write_checkpoint(tmp_path, "a", signatures=[["y"]])        # the two checkpoints swap signatures
+    _write_checkpoint(tmp_path, "b", signatures=[["x"]])
+    body = client.post("/reload").json()
+    assert sorted(body["updated"]) == ["a", "b"] and body["registered_errors"] == {}
+    assert router.registered["a"]["signatures"] == [["y"]] and router.registered["b"]["signatures"] == [["x"]]
+
+    open(os.path.join(str(tmp_path), "a", "checkpoint.json"), "w").write("{not json")     # edited mid-write
+    os.makedirs(tmp_path / "c")
+    open(tmp_path / "c" / "model.safetensors", "wb").close()                                # no manifest yet
+    body = client.post("/reload").json()
+    assert sorted(body["registered_errors"]) == ["a", "c"] and "cannot read" in body["registered_errors"]["a"]
+    assert "no manifest" in body["registered_errors"]["c"]
+    assert sorted(body["registered"]) == ["b"] and body["removed"] == ["a"]
+    assert client.get("/health").json()["registered_errors"] == body["registered_errors"]
+    assert client.post("/reload").json()["registered_errors"] == body["registered_errors"]  # stable
+
+
+def test_reload_keeps_the_default_model(monkeypatch, tmp_path):
+    import shutil
+
+    _write_checkpoint(tmp_path, "research")
+    router, _ = _stub_router(monkeypatch, tmp_path, LAYA_DEFAULT_MODEL="research")
+    client = TestClient(create_app(router=router))
+    shutil.rmtree(tmp_path / "research")
+    body = client.post("/reload").json()
+    assert body["removed"] == [] and list(body["registered"]) == ["research"]
+    assert "default model" in body["registered_errors"]["research"]
+
+
+def test_reload_keeps_the_scan_reason_of_a_default_model_with_a_bad_manifest(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path, "deflt")
+    router, _ = _stub_router(monkeypatch, tmp_path, LAYA_DEFAULT_MODEL="deflt")
+    client = TestClient(create_app(router=router))
+    open(tmp_path / "deflt" / "checkpoint.json", "w").write("{oops")
+    reason = client.post("/reload").json()["registered_errors"]["deflt"]
+    assert "cannot read" in reason and "still registered: it is the default model" in reason
+
+
+def test_reload_refused_update_restores_the_old_registration(monkeypatch, tmp_path):
+    """G1-300: a changed checkpoint whose new signature is taken keeps its old source and signatures."""
+    import shutil
+
+    _write_checkpoint(tmp_path, "deflt", signatures=[["s1"]])
+    _write_checkpoint(tmp_path, "alpha", signatures=[["s2"]])
+    router, _ = _stub_router(monkeypatch, tmp_path, LAYA_DEFAULT_MODEL="deflt")
+    client = TestClient(create_app(router=router))
+    before = dict(router.registered["alpha"])
+    shutil.rmtree(tmp_path / "deflt")           # kept as the default, so s1 stays taken
+    _write_checkpoint(tmp_path, "alpha", signatures=[["s1"]], source="org/alpha-v2")
+    body = client.post("/reload").json()
+    assert "already registered" in body["registered_errors"]["alpha"]
+    assert body["updated"] == [] and router.registered["alpha"] == before
+
+
+def test_reload_an_edited_manifest_never_displaces_a_working_checkpoint(monkeypatch, tmp_path):
+    """G2-304: the edited manifest is refused whichever directory sorts first."""
+    _write_checkpoint(tmp_path, "alpha", signatures=[["s2"]])
+    _write_checkpoint(tmp_path, "beta", signatures=[["s3"]])
+    router, _ = _stub_router(monkeypatch, tmp_path)
+    client = TestClient(create_app(router=router))
+    _write_checkpoint(tmp_path, "alpha", signatures=[["s3"]])       # alpha sorts first and claims beta's signature
+    _write_checkpoint(tmp_path, "aardvark", signatures=[["s3"]])    # so does a new fine-tune
+    body = client.post("/reload").json()
+    assert "beta" in body["registered"] and body["registered"]["beta"]["signatures"] == [["s3"]]
+    assert "removed" in body and "beta" not in body["removed"]
+    assert sorted(body["registered_errors"]) == ["aardvark", "alpha"]
+    assert "already registered" in body["registered_errors"]["alpha"]
+
+
+def test_reload_needs_the_bearer(monkeypatch, tmp_path):
+    router, _ = _stub_router(monkeypatch, tmp_path)
+    monkeypatch.setenv("LAYA_API_KEY", "s3cret")
+    client = TestClient(create_app(router=router))
+    _write_checkpoint(tmp_path, "research")
+    assert client.post("/reload").status_code == 401
+    assert client.post("/reload", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert router.registered == {}                          # a refused call changed nothing
+    ok = client.post("/reload", headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200 and ok.json()["added"] == ["research"]
+
+
+def test_reload_never_removes_what_it_did_not_register(monkeypatch, tmp_path):
+    """An injected router has no store state: a reload adds and replaces, and leaves its own entries."""
+    from laya.router import Router
+
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    router = Router(models={"mine": "/tmp/laya-mine"})
+    client = TestClient(create_app(router=router))
+    _write_checkpoint(tmp_path, "research")
+    body = client.post("/reload").json()
+    assert body["added"] == ["research"] and sorted(body["registered"]) == ["mine", "research"]
+
+
+def test_reload_unreadable_store_is_a_500_and_changes_nothing(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path / "store", "research")
+    router, _ = _stub_router(monkeypatch, tmp_path / "store")
+    client = TestClient(create_app(router=router))
+    os.chmod(tmp_path / "store", 0)
+    try:
+        if not os.access(tmp_path / "store", os.R_OK):
+            r = client.post("/reload")
+            assert r.status_code == 500 and r.json()["detail"] == "cannot list the checkpoint store"
+            assert str(tmp_path) not in r.text
+            assert list(router.registered) == ["research"]
+    finally:
+        os.chmod(tmp_path / "store", 0o755)
+
+
+def test_reload_is_refused_by_a_router_that_cannot_unregister(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    assert TestClient(create_app(router=FakeRouter())).post("/reload").status_code == 501
+
+
+# --------------------------------------------------------------------- the client-verified behaviours (C-6)
+# Each of these was checked by hand against a running server; they run here through HTTP on a real
+# Router whose Agent is a stub. Other layers keep their own: tests/test_router.py covers signature
+# matching, pins and the health shape of `registered` in depth (see the pinned/ and options sections),
+# and tests/test_store.py the manifests.
+_SCREEN_ASK = "Read or skip this reference?"
+
+
+def _screen_question(**overrides):
+    question = {"type": "choice", "instructions": _SCREEN_ASK, "criteria": {"read": "yes", "skip": "no"}}
+    question.update(overrides)
+    return {"research.screen": question}
+
+
+def _post(client, questions, **body):
+    return client.post("/v1/systemone", json={"state": "A claim about transparency.", "questions": questions, **body})
+
+
+def test_registered_checkpoint_routes_end_to_end(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path, "research", description="Screens references", signatures=[
+        {"ids": ["research.screen"], "instructions": {"research.screen": _SCREEN_ASK},
+         "options": {"research.screen": ["read", "skip"]}, "for": "screening"}])
+    _write_checkpoint(tmp_path, "plain", signatures=[["other"]])
+    router, built = _stub_router(monkeypatch, tmp_path)
+    client = TestClient(create_app(router=router))
+
+    # store registration, and /health listing the faceted shape
+    from laya.router import instructions_digest
+    listed = client.get("/health").json()["registered"]
+    assert sorted(listed) == ["plain", "research"]
+    assert listed["research"]["signatures"] == [
+        {"ids": ["research.screen"], "instructions": {"research.screen": instructions_digest(_SCREEN_ASK)},
+         "options": {"research.screen": ["read", "skip"]}, "for": "screening"}]
+    assert listed["research"]["description"] == "Screens references" and listed["plain"]["signatures"] == [["other"]]
+
+    # a namespaced question id selects the checkpoint with no `model`
+    routed = _post(client, _screen_question()).json()["routing"]
+    assert routed["model"] == "research" and built == [str(tmp_path / "research")]
+    # an instruction pin: changed text falls back to language routing
+    assert _post(client, _screen_question(instructions="Read it?")).json()["routing"]["model"] == "english"
+    # an options pin: an extra label falls back
+    extra = _screen_question(criteria={"read": "yes", "skip": "no", "maybe": "later"})
+    assert _post(client, extra).json()["routing"]["model"] == "english"
+    # an explicit model still wins over a signature
+    assert _post(client, _screen_question(), model="english").json()["routing"]["model"] == "english"
+    assert _post(client, {"x": _SECTION_Q["section"]}, model="plain").json()["routing"]["model"] == "plain"
+
+
+def test_idle_unload_frees_a_registered_checkpoint_and_the_next_request_reloads_it(monkeypatch, tmp_path):
+    import time
+
+    _write_checkpoint(tmp_path, "research", signatures=[["section"]])
+    router, built = _stub_router(monkeypatch, tmp_path, LAYA_IDLE_UNLOAD_SECONDS="0.1")
+    with TestClient(create_app(router=router)) as client:
+        assert _post(client, _SECTION_Q).json()["routing"]["model"] == "research"
+        assert router.loaded == ["research"] and built == [str(tmp_path / "research")]
+        deadline = time.monotonic() + 3.0
+        while router.loaded and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert router.loaded == []                                  # the reaper unloaded it...
+        assert list(client.get("/health").json()["registered"]) == ["research"]    # ...but it is still registered
+        assert _post(client, _SECTION_Q).json()["routing"]["model"] == "research"
+        assert built == [str(tmp_path / "research")] * 2            # rebuilt from its source on demand
+
+
+def test_default_model_option_accepts_the_names_it_is_told_about(monkeypatch):
+    from laya.serve import _default_model_option
+
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "research")
+    assert _default_model_option(("research",)) == {"default": "research"}
+    assert _default_model_option({"research": object()}) == {"default": "research"}
+    with pytest.raises(ValueError):
+        _default_model_option()
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "ml")
+    assert _default_model_option(("research",)) == {"default": "multilingual"}
+
+
+def test_build_router_preloads_only_the_built_ins_by_default(monkeypatch, tmp_path):
+    from laya.router import Router
+    from laya.serve import build_router
+
+    _store_with_research(str(tmp_path))
+    for name in ("LAYA_MODELS", "LAYA_DEFAULT_MODEL", "LAYA_DEVICE", "LAYA_MAX_LOADED", "LAYA_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))
+    monkeypatch.setenv("LAYA_PRELOAD", "1")
+    seen = {}
+    monkeypatch.setattr(Router, "preload", lambda self, names=None: seen.setdefault("names", names) or self)
+    build_router()
+    assert seen["names"] == ["english", "multilingual", "typed-decisions"]
+
+
+def test_build_router_describes_and_defaults_a_mixed_case_store_name(monkeypatch, tmp_path):
+    from laya.serve import build_router
+
+    path = tmp_path / "Research"
+    os.makedirs(path)
+    open(path / "model.safetensors", "wb").close()
+    json.dump({"description": "Files claims"}, open(path / "checkpoint.json", "w"))
+    for name in ("LAYA_MODELS", "LAYA_DEVICE", "LAYA_MAX_LOADED", "LAYA_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LAYA_CHECKPOINTS_DIR", str(tmp_path))
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "Research")
+    router = build_router()
+    assert router.registered["research"]["description"] == "Files claims"
+    assert router.default == "research"
+
+
+def test_health_reports_pinned_signatures(monkeypatch):
+    """A signature that pins instructions is reported with the digests, an id-only one as a list."""
+    from laya.router import Router, instructions_digest
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    text = "Which section of the brief does this claim belong to?"
+    router = Router(models={"research": "/tmp/laya-research"},
+                    signatures={"research": [["screen"], {"section": text, "subsection": None}]})
+    body = TestClient(create_app(router=router)).get("/health").json()
+    assert body["registered"]["research"]["signatures"] == [
+        ["screen"],
+        {"ids": ["section", "subsection"], "instructions": {"section": instructions_digest(text)}},
+    ]
+
+
+def test_health_reports_option_pins_and_purpose(monkeypatch):
+    from laya.router import Router, instructions_digest
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    text = "Read or skip this reference?"
+    router = Router(models={"research": "/tmp/laya-research"},
+                    signatures={"research": [{"ids": ["screen"], "instructions": {"screen": text},
+                                              "options": {"screen": ["skip", "read"]}, "for": "screening"}]})
+    body = TestClient(create_app(router=router)).get("/health").json()
+    assert body["registered"]["research"]["signatures"] == [
+        {"ids": ["screen"], "instructions": {"screen": instructions_digest(text)},
+         "options": {"screen": ["read", "skip"]}, "for": "screening"},
+    ]
+
+
+def test_health_registered_docs_describe_faceted_shape():
+    page = open(os.path.join(ROOT, "docs", "http-api.md"), encoding="utf-8").read()
+    start = page.index("- `registered` is the deployment's own checkpoints")
+    bullet = page[start:page.index("\n\n", start)]
+    assert "options" in bullet and "`for`" in bullet

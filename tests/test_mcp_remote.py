@@ -283,6 +283,17 @@ def test_remote_route_tools_do_not_contact_the_server(serve):
     assert not FakeServe.requests
 
 
+def test_remote_mcp_keeps_a_store_checkpoint_as_the_default(monkeypatch, serve):
+    monkeypatch.setenv("LAYA_BASE_URL", serve)
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "research")
+    monkeypatch.setattr(mcp_server, "_ROUTER", None)
+    router = mcp_server._ensure_router()
+    assert router.default == "research"
+    decision = router.route({"text": "hello there friend"}, None)
+    assert decision.model == "research"
+    monkeypatch.setattr(mcp_server, "_ROUTER", None)
+
+
 @pytest.mark.parametrize("url", ["file:///tmp/model", "localhost:8000", "http://", "http://host?q=x", "http://host#x"])
 def test_remote_router_requires_an_http_server_url(url):
     with pytest.raises(ValueError, match="HTTP"):
@@ -373,3 +384,72 @@ def test_remote_transport_reports_malformed_responses(monkeypatch, raw):
     with pytest.raises(RemoteError) as info:
         RemoteRouter("http://localhost:8000").predict("x", _questions())
     assert info.value.code == "upstream_error"
+
+
+# --------------------------------------------------------------------- registered checkpoints
+# The server owns the registry (LAYA_CHECKPOINTS_DIR). A name that is not a built-in passes through
+# this process for the server to resolve, and the server's `registered` list comes back in status.
+def test_registered_names_pass_through_to_the_server(serve, monkeypatch):
+    monkeypatch.setitem(HEALTH, "registered", {"research": {"source": "/srv/research"}})
+    router = RemoteRouter(serve)
+    assert router.resolve("research") == "research"
+    assert router.resolve(" Research ") == "research"
+    with pytest.raises(ValueError):
+        router.resolve("multilingal")
+    with pytest.raises(ToolError) as typo:
+        laya_predict({"text": "x"}, _questions(), model="multilingal", router=router)
+    assert typo.value.code == "invalid_model"
+    assert router.resolve("ml") == "multilingual"
+    with pytest.raises(ValueError):
+        router.resolve("not a/name")
+    router.predict("x", _questions(), model="research")
+    assert FakeServe.requests[-1][2]["model"] == "research"
+    decision = router.route("x", _questions(), model="research")
+    assert (decision.model, decision["repo"]) == ("research", None)
+    out = laya_predict({"text": "x"}, _questions(), model="research", router=router)
+    assert FakeServe.requests[-1][2]["model"] == "research"
+    assert out["routing"] == ANSWER["routing"]
+    with pytest.raises(ToolError) as exc:
+        laya_predict({"text": "x"}, _questions(), model="not a/name", router=router)
+    assert exc.value.code == "invalid_model"
+
+
+def test_a_store_name_is_not_called_invalid_when_the_server_cannot_be_asked(serve, monkeypatch):
+    monkeypatch.setitem(HEALTH, "registered", {"research": {"source": "/srv/research"}})
+    FakeServe.require_bearer = "secret"
+    wrong = RemoteRouter(serve, api_key="nope")
+    with pytest.raises(ToolError) as exc:
+        laya_predict({"text": "x"}, _questions(), model="research", router=wrong)
+    assert exc.value.code == "unauthorized"
+    with pytest.raises(ToolError) as down:
+        laya_predict({"text": "x"}, _questions(), model="research", router=RemoteRouter("http://127.0.0.1:9"))
+    assert down.value.code == "unreachable"
+
+
+def test_a_typo_against_a_server_from_before_the_store_is_invalid_model(serve, monkeypatch):
+    monkeypatch.delitem(HEALTH, "registered", raising=False)
+    HEALTH.setdefault("loaded", [])
+    with pytest.raises(ToolError) as exc:
+        laya_predict({"text": "x"}, _questions(), model="multilingal", router=RemoteRouter(serve))
+    assert exc.value.code == "invalid_model"
+
+
+def test_a_registered_name_is_checked_against_health_once(serve, monkeypatch):
+    monkeypatch.setitem(HEALTH, "registered", {"research": {"source": "/srv/research"}})
+    router = RemoteRouter(serve)
+    for _ in range(3):
+        assert router.resolve("research") == "research"
+    laya_route({"text": "x"}, _questions(), model="research", router=router)
+    assert [r[1] for r in FakeServe.requests].count("/health") == 1
+
+
+def test_status_reports_the_servers_registered_checkpoints(serve, monkeypatch):
+    registered = {"research": {"source": "/srv/laya/research", "signatures": [["section"]], "description": None}}
+    monkeypatch.setitem(HEALTH, "registered", registered)
+    try:
+        router = RemoteRouter(serve)
+        assert router.registered == registered
+        assert laya_status(router=router)["server"]["registered"] == registered
+        assert laya_status(router=router)["registered"] == registered
+    finally:
+        HEALTH.pop("registered", None)

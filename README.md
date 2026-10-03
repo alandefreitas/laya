@@ -692,10 +692,14 @@ your traffic is not English), `LAYA_MAX_LOADED` (checkpoints resident at
 once, 2 by default; raise it to 3 when `LAYA_AUTO_TASK` makes a third one
 reachable on demand, or the server rebuilds one every time routing switches),
 `LAYA_IDLE_UNLOAD_SECONDS` (unload idle checkpoints; `0` disables it, `300` frees device memory
-after five minutes and makes the next request pay a cold load), and `LAYA_API_KEY` (when set, clients must
+after five minutes and makes the next request pay a cold load), `LAYA_CHECKPOINTS_DIR` (a store of
+your own checkpoints, one directory per checkpoint, each served beside the built-ins under its own
+name and selected by the question-id signatures its required `checkpoint.json` manifest declares (`POST /reload` rescans it without a restart); see
+[Serving your own checkpoints](https://nandhakishorm.github.io/laya/http-api/#serving-your-own-checkpoints)),
+and `LAYA_API_KEY` (when set, clients must
 send `Authorization: Bearer <key>`). A client's `model` field is honoured when it
-names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`), otherwise
-the router auto-selects by script/language. The same body can also carry `task`,
+names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`, or one registered from the
+store), otherwise the router auto-selects by script/language. The same body can also carry `task`,
 `lang`, `lang_guess`, `min_confidence`, `max_len` and `head_max_len` — the controls
 `Router.predict` takes that a JSON body can state — while the five hook arguments
 (`hooks`, `on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`) are refused
@@ -1254,9 +1258,10 @@ package:
 |---|---|---|
 | `LAYA_DEVICE` | (auto) | Same as `laya.serve`: the device type is lower-cased (`CUDA` → `cuda`, `CUDA:0` → `cuda:0`) and passed to torch, whose device parser is case-sensitive |
 | `LAYA_PRELOAD` | `1` | Same as `laya.serve`: build the checkpoints at startup, not lazily |
-| `LAYA_MODELS` | `english,multilingual` | Comma list to preload (serve contract). MCP difference: an empty value preloads `english,multilingual` so `typed-decisions` stays lazy; in `laya.serve` empty means every checkpoint |
+| `LAYA_MODELS` | `english,multilingual` | Comma list to preload (serve contract). MCP difference: an empty value preloads `english,multilingual` so `typed-decisions` stays lazy; in `laya.serve` empty means every built-in checkpoint |
 | `LAYA_THREADS` | (torch default) | Same as `laya.serve`: cap torch intra-op threads for CPU inference; keep it at or below the physical core count |
 | `LAYA_AUTO_TASK` | `0` | Same as `laya.serve`: `1` lets a request whose question ids match a typed-decisions workflow route to that checkpoint, which is then loaded on demand; it never joins the preload list |
+| `LAYA_CHECKPOINTS_DIR` | `$XDG_DATA_HOME/laya/checkpoints` | Same as `laya.serve`: a store of your own checkpoints, served beside the built-ins under their own names and selected by their manifests' question-id signatures; in remote mode (`LAYA_BASE_URL`) the server's store applies |
 
 The tools return structured JSON (answers with probabilities, routing metadata, device,
 `latency_ms`). `laya_predict_batch` and `laya_route_batch` are the MCP form of

@@ -6,7 +6,7 @@ output_tokens}`` usage block -- so a client written against Jev (for example the
 `hs-jev` Haskell client) can point its ``baseUrl`` at this server and keep
 working unchanged. All this module adds is the HTTP surface Laya itself does not
 ship: a ``POST /v1/systemone`` route and its ``POST /v1/systemone/batch`` sibling,
-an optional bearer check, and a health probe.
+an optional bearer check, a health probe, and ``POST /reload``, which rescans the checkpoint store.
 
 Configuration is entirely via environment variables so the same entry point
 serves a laptop dev run and a systemd unit:
@@ -19,7 +19,7 @@ env var                    meaning                                        defaul
 ``LAYA_DEVICE``            torch device for every checkpoint              (auto)
 ``LAYA_PRELOAD``           build the checkpoints at startup, not lazily   1
 ``LAYA_MODELS``            comma list to preload (english,multilingual,   (all)
-                           typed-decisions); empty = every checkpoint
+                           typed-decisions); empty = every built-in
 ``LAYA_THREADS``           cap torch intra-op threads (CPU inference).    (torch
                            Keep <= physical cores; oversubscribing the     default)
                            logical/hyperthread count is a large regression.
@@ -30,6 +30,9 @@ env var                    meaning                                        defaul
                            routing can choose, one reloads per switch.
 ``LAYA_IDLE_UNLOAD_SECONDS`` unload checkpoints after this many idle     0 (off)
                            seconds; the next request loads them again.
+``LAYA_CHECKPOINTS_DIR``   store of your own checkpoints, served beside    ~/.local/share/laya/
+                           the built-ins by name and question-id           checkpoints
+                           signature; each needs a ``checkpoint.json``
 ``LAYA_API_KEY``           if set, require ``Authorization: Bearer <it>``  (none)
 ``LAYA_ROOT_PATH``         public URL prefix behind a reverse proxy        (none)
 ``LAYA_LOG_LEVEL``         uvicorn log level                              info
@@ -60,7 +63,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 # A failed inference is reported to the client as a fixed 500 so nothing about paths,
 # weights or memory state leaks, which leaves the server log as the only place the
@@ -212,24 +215,73 @@ def _published_model_ids() -> Dict[str, str]:
     return {repo: name for name, repo in STANDALONE_MODELS.items() if repo != BUNDLE_REPO}
 
 
-def _resolve_model(model: Optional[str]) -> Optional[str]:
-    """Map a client's `model` field onto a Laya checkpoint, or None to auto-route."""
+def _resolve_model(model: Optional[str], router: Any = None) -> Optional[str]:
+    """Map a client's `model` field onto a Laya checkpoint, or None to auto-route.
+
+    The accepted names are the router's own: the built-ins and their aliases, plus whatever the
+    deployment registered (the checkpoints in ``LAYA_CHECKPOINTS_DIR``), read through
+    ``router.resolve`` when the router has one and ``normalise_name`` otherwise.
+    """
     if not model:
         return None
     published = _published_model_ids().get(str(model).strip().lower())
     if published is not None:
         return published
-    from .router import normalise_name
+    resolve = getattr(router, "resolve", None) if router is not None else None
+    if not callable(resolve):
+        from .router import normalise_name
+        resolve = normalise_name
 
-    # normalise_name raises ValueError on anything that is not a known checkpoint
-    # or alias, and returns a name from router.DEFAULT_MODELS when it does accept one --
-    # so it is the only list of accepted names this needs. A Jev client's `model` field
-    # (e.g. "jev-1") is expected to miss; treat that as "no explicit checkpoint" and let
-    # the router auto-select.
+    # The resolver raises ValueError on anything that is not a known checkpoint or alias, and
+    # returns the canonical name when it does accept one -- so it is the only list of accepted
+    # names this needs. A Jev client's `model` field (e.g. "jev-1") is expected to miss; treat
+    # that as "no explicit checkpoint" and let the router auto-select.
     try:
-        return normalise_name(model)
+        return resolve(model)
     except Exception:
         return None
+
+
+_UNKNOWN_MODELS_LOGGED: set = set()
+_UNKNOWN_MODELS_LOGGED_MAX = 256
+
+
+def _unknown_model_name(model: Any, resolved: Optional[str]) -> Optional[str]:
+    """The `model` text a client sent when it named something that resolved to nothing, else None.
+
+    Empty values, the bundle repo id (documented as "let the Router choose") and ``auto`` are not
+    misses. A miss still auto-routes, which is the contract Jev clients rely on (``jev-1``); this only
+    lets the response and the log say the name did not match, once per distinct name in the log.
+    """
+    if resolved is not None or not model:
+        return None
+    from .router import BUNDLE_REPO
+
+    text = str(model).strip()
+    if not text or text.lower() in ("auto", BUNDLE_REPO):
+        return None
+    text = text.replace("\n", " ").replace("\r", " ")[:100]
+    if text not in _UNKNOWN_MODELS_LOGGED and len(_UNKNOWN_MODELS_LOGGED) < _UNKNOWN_MODELS_LOGGED_MAX:
+        _UNKNOWN_MODELS_LOGGED.add(text)
+        _log.warning("unknown model %r: routed automatically instead (logged once per name)", text)
+    return text
+
+
+def _note_unknown_model(result: Any, name: Optional[str]) -> None:
+    """Prefix `routing.reason` of a result with ``unknown model <name>; `` when the name missed."""
+    routing = result.get("routing") if name is not None and isinstance(result, dict) else None
+    if isinstance(routing, dict) and isinstance(routing.get("reason"), str):
+        routing["reason"] = "unknown model %s; %s" % (name, routing["reason"])
+
+
+def _laya_version() -> str:
+    """The laya package version of the code that is running: ``laya.__version__``.
+
+    Not ``importlib.metadata``: an editable install keeps the version it was installed at in its
+    dist-info, so after a ``git pull`` the metadata names a build the server is no longer running.
+    """
+    from . import __version__
+    return __version__
 
 
 def _resolve_max_concurrent() -> int:
@@ -448,7 +500,7 @@ def _resolve_max_loaded() -> Optional[int]:
     return n if n > 0 else None
 
 
-def _default_model_option() -> Dict[str, str]:
+def _default_model_option(known: Iterable[str] = ()) -> Dict[str, str]:
     """Routing fallback from ``LAYA_DEFAULT_MODEL``, as a ``Router`` keyword; unset sends nothing.
 
     ``Router.default`` answers the two states that carry no language evidence at all: no letters,
@@ -468,8 +520,12 @@ def _default_model_option() -> Dict[str, str]:
     raw = os.environ.get("LAYA_DEFAULT_MODEL")
     if raw is None or not raw.strip():
         return {}
-    from .router import normalise_name
+    from .router import canonical_name, normalise_name
 
+    # `known` is the checkpoints this deployment registers beside the built-ins (the store's), so
+    # one of them may be the fallback too; they are canonical names already.
+    if canonical_name(raw) in set(known):
+        return {"default": canonical_name(raw)}
     try:
         name = normalise_name(raw)
     except ValueError as error:
@@ -802,7 +858,7 @@ def _apply_thread_limit():
 def build_router():
     """Build a Router from the environment, preloading unless told otherwise."""
     from .mcp.device import env_device
-    from .router import Router
+    from .router import DEFAULT_MODELS, Router
 
     _apply_thread_limit()
     # `env_device` rather than a raw read: it strips, the way `LAYA_MODELS` two lines
@@ -810,18 +866,42 @@ def build_router():
     # trailing newline, and torch refuses that as an invalid device string.
     device = env_device()
     models_env = os.environ.get("LAYA_MODELS", "").strip()
-    preload_names = [m.strip() for m in models_env.split(",") if m.strip()] or None
+    # Unset means the built-ins: a store full of fine-tunes loads on first use, not at startup.
+    preload_names = [m.strip() for m in models_env.split(",") if m.strip()] or list(DEFAULT_MODELS)
     options = {"device": device, "auto_task_detection": _env_bool("LAYA_AUTO_TASK", False)}
     max_loaded = _resolve_max_loaded()
     if max_loaded is not None:
         options["max_loaded"] = max_loaded
-    # Resolved before the Router is built: a name `Router` would reject is a configuration error,
-    # and `_resolve_port`'s idiom applies -- exit with the message, not a traceback.
+    # The deployment's own checkpoints (`LAYA_CHECKPOINTS_DIR`), registered beside the built-ins
+    # so `model=<name>` and their question-id signatures reach them. Read before the default model,
+    # which may name one of them; a broken manifest is a configuration error like a bad default.
+    from .store import router_options, scan
     try:
-        options.update(_default_model_option())
+        store, store_errors = scan()
+    except ValueError as error:      # the store directory itself cannot be read
+        raise SystemExit(str(error)) from None
+    for entry, why in store_errors.items():
+        _log.error("checkpoint store: skipped %s: %s", entry, why)
+    options.update(router_options(store))
+    # Resolved before the Router is built: a name `Router` would reject is a configuration error,
+    # and `_resolve_port`'s idiom applies -- exit with the message, not a traceback. A default
+    # naming a skipped checkpoint stays one: it is explicit configuration.
+    try:
+        options.update(_default_model_option(store))
+    except ValueError as error:
+        skipped = store_errors.get((os.environ.get("LAYA_DEFAULT_MODEL") or "").strip().lower())
+        raise SystemExit("%s (that checkpoint was skipped: %s)" % (error, skipped) if skipped else str(error)) from None
+    try:
+        router = Router(**options)
     except ValueError as error:
         raise SystemExit(str(error)) from None
-    router = Router(**options)
+    for checkpoint in store.values():
+        if checkpoint.description:
+            router.descriptions[checkpoint.name] = checkpoint.description
+    # What this server registered from the store and what it skipped: `create_app` reports the
+    # second in `/health` and `POST /reload` reconciles against the first.
+    router.store_checkpoints = store
+    router.store_errors = store_errors
     if _env_bool("LAYA_PRELOAD", True):
         router.preload(preload_names)
     return router
@@ -940,6 +1020,12 @@ def create_app(router: Optional[Any] = None):
         if not _authorized(authorization):
             raise HTTPException(status_code=401, detail="invalid or missing bearer token")
 
+    # What the store contributed to this router, by name, and the directories it skipped. A router
+    # injected by a caller carries neither, so a reload then only adds and replaces: it never
+    # removes what it did not register.
+    store_state: Dict[str, Any] = {"checkpoints": dict(getattr(router, "store_checkpoints", None) or {}),
+                                   "errors": dict(getattr(router, "store_errors", None) or {})}
+
     @app.get("/health")
     def health(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
         # `device` is where a resident checkpoint really computes, not what was asked for:
@@ -985,6 +1071,12 @@ def create_app(router: Optional[Any] = None):
             "device_is_preference": actual is None,
             "checkpoint_devices": checkpoint_devices,
             "cpu_fallbacks": fallbacks,
+            # The deployment's own checkpoints, served beside the built-ins: name -> source,
+            # question-id signatures, description. Empty on a stock server.
+            "registered": getattr(router, "registered", None) or {},
+            # Store directories skipped at startup or by the last `POST /reload`: name -> why.
+            "registered_errors": dict(store_state["errors"]),
+            "version": _laya_version(),
             **idle,
         }
 
@@ -1005,6 +1097,93 @@ def create_app(router: Optional[Any] = None):
             yield
         finally:
             admission.release()
+
+    def _reload_store() -> Dict[str, Any]:
+        """Rescan the store and reconcile the router with it. Runs on the inference worker."""
+        from .store import scan
+        old: Dict[str, Any] = store_state["checkpoints"]
+        found, errors = scan(keep=old)      # a conflict refuses the edited manifest, not the one being served
+        errors = dict(errors)
+        kept = dict(old)
+        added: list = []
+        updated: list = []
+        removed: list = []
+        for name in sorted(set(old) - set(found)):
+            if name == getattr(router, "default", None):
+                # LAYA_DEFAULT_MODEL is explicit configuration: keep serving it, say why.
+                entry = os.path.basename(old[name].path)
+                note = "still registered: it is the default model (%s)" % name
+                errors[entry] = "%s; %s" % (errors[entry], note) if entry in errors else note   # keep scan()'s reason
+                continue
+            router.unregister(name)
+            kept.pop(name, None)
+            removed.append(name)
+        pending = [c for c in found.values() if old.get(c.name) != c]
+        failed: Dict[str, str] = {}
+        cleared = False
+        while pending:
+            # A signature may move from one checkpoint to another in one reload, so a refusal is
+            # retried once the other registrations have gone through.
+            progressed, retry = False, []
+            for c in pending:
+                try:
+                    router.register(c.name, c.source, signatures=c.signatures, description=c.description)
+                except ValueError as error:
+                    failed[c.name] = str(error)
+                    retry.append(c)
+                    continue
+                failed.pop(c.name, None)
+                progressed = True
+                if c.description is None:
+                    router.descriptions.pop(c.name, None)
+                if c.name in old:
+                    updated.append(c.name)
+                    if old[c.name].source != c.source:
+                        router.unload(c.name)   # the resident Agent was built from the old source
+                else:
+                    added.append(c.name)
+                kept[c.name] = c
+            pending = retry
+            if not progressed:
+                if cleared:
+                    break
+                # Signatures swapped in a cycle: free them all first (those checkpoints answer by
+                # language for an instant), then the second pass can register each set.
+                cleared = True
+                for c in pending:
+                    # An existing checkpoint keeps its old source here: only its signatures go.
+                    router.register(c.name, old[c.name].source if c.name in old else c.source, signatures=[])
+        for c in pending:
+            errors[os.path.basename(c.path)] = failed[c.name]
+            if not cleared:
+                continue
+            if c.name not in old:
+                router.unregister(c.name)       # registered bare by the cycle breaker, never completed
+                continue
+            prior = old[c.name]                 # refused after the cycle breaker freed its signatures: put it back
+            try:
+                router.register(c.name, prior.source, signatures=prior.signatures, description=prior.description)
+            except ValueError as error:
+                errors[os.path.basename(c.path)] += "; its earlier signatures could not be restored: %s" % error
+        for entry, why in errors.items():
+            _log.error("checkpoint store: skipped %s: %s", entry, why)
+        store_state["checkpoints"] = kept
+        store_state["errors"] = errors
+        _log.info("checkpoint store reloaded: added %s, updated %s, removed %s", added, updated, removed)
+        return {"registered": getattr(router, "registered", None) or {}, "registered_errors": dict(errors),
+                "added": sorted(added), "updated": sorted(updated), "removed": sorted(removed)}
+
+    @app.post("/reload")
+    async def reload_store(authorization: Optional[str] = Header(default=None)):
+        _check_auth(authorization)
+        async with _admit():
+            if not hasattr(router, "unregister"):
+                raise HTTPException(status_code=501, detail="this router cannot unregister checkpoints")
+            try:
+                return await asyncio.get_running_loop().run_in_executor(pool, _reload_store)
+            except ValueError as error:     # the store directory itself cannot be read
+                _log.error("checkpoint store: reload failed: %s", error)
+                raise HTTPException(status_code=500, detail="cannot list the checkpoint store")
 
     @app.post("/v1/systemone")
     async def systemone(request: Request, authorization: Optional[str] = Header(default=None)):
@@ -1030,7 +1209,8 @@ def create_app(router: Optional[Any] = None):
         # the time `json.loads` is done, so only lone ones are rejected here.
         if _has_lone_surrogate(body):
             raise HTTPException(status_code=400, detail=_LONE_SURROGATE_DETAIL)
-        model = _resolve_model(body.get("model"))
+        model = _resolve_model(body.get("model"), router)
+        missed = _unknown_model_name(body.get("model"), model)
         max_budget_cap = _resolve_max_token_budget()
         max_len = _validate_budget_param(body, "max_len", max_budget_cap)
         head_max_len = _validate_budget_param(body, "head_max_len", max_budget_cap)
@@ -1065,6 +1245,7 @@ def create_app(router: Optional[Any] = None):
                 result = await loop.run_in_executor(
                     pool, _run_inference, partial(router.predict, state, questions, model=model, **predict_kwargs))
                 infer_ms = (time.perf_counter() - t0) * 1000.0
+                _note_unknown_model(result, missed)
                 if _env_bool("LAYA_JEV_STRICT", False):
                     result = _project_jev_strict(result)
                 from fastapi.responses import JSONResponse
@@ -1124,7 +1305,8 @@ def create_app(router: Optional[Any] = None):
         # and `MAX_QUESTIONS` bound what the walk can reach.
         if _has_lone_surrogate(body):
             raise HTTPException(status_code=400, detail=_LONE_SURROGATE_DETAIL)
-        model = _resolve_model(body.get("model"))
+        model = _resolve_model(body.get("model"), router)
+        missed = _unknown_model_name(body.get("model"), model)
         max_budget_cap = _resolve_max_token_budget()
         max_len = _validate_budget_param(body, "max_len", max_budget_cap)
         head_max_len = _validate_budget_param(body, "head_max_len", max_budget_cap)
@@ -1203,6 +1385,8 @@ def create_app(router: Optional[Any] = None):
                 t0 = time.perf_counter()
                 batch_res = await loop.run_in_executor(pool, _run_inference, _do_batch)
                 infer_ms = (time.perf_counter() - t0) * 1000.0
+                for item in batch_res["results"]:
+                    _note_unknown_model(item, missed)
                 if _env_bool("LAYA_JEV_STRICT", False):
                     batch_res["results"] = [_project_jev_strict(item) for item in batch_res["results"]]
                 from fastapi.responses import JSONResponse

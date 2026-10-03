@@ -169,6 +169,20 @@ in
       '';
     };
 
+    checkpointsDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/var/lib/laya/checkpoints";
+      description = ''
+        A store of your own checkpoints, one directory per checkpoint with an optional
+        `checkpoint.json` manifest (sets `LAYA_CHECKPOINTS_DIR`). Each is served beside the
+        built-ins under its own name, selected with `model=<name>` or by the question-id
+        signatures its manifest declares. The unit runs with `DynamicUser` and `ProtectHome`, so
+        the path must be readable by it, for example under `/var/lib`; a store under `/home` is
+        invisible and reads as empty. Null uses `/var/lib/<stateDirectory>/checkpoints`.
+      '';
+    };
+
     threads = lib.mkOption {
       type = lib.types.nullOr lib.types.ints.positive;
       default = null;
@@ -345,6 +359,10 @@ in
         OMP_NUM_THREADS = toString cfg.threads;
       } // lib.optionalAttrs (cfg.idleUnloadSeconds != null) {
         LAYA_IDLE_UNLOAD_SECONDS = toString cfg.idleUnloadSeconds;
+      } // {
+        LAYA_CHECKPOINTS_DIR =
+          if cfg.checkpointsDir != null then cfg.checkpointsDir
+          else "/var/lib/${cfg.stateDirectory}/checkpoints";
       } // lib.optionalAttrs (cfg.rootPath != null) {
         LAYA_ROOT_PATH = cfg.rootPath;
       } // lib.optionalAttrs (cfg.logLevel != null) {

@@ -782,6 +782,18 @@ _unreferenced = [n for n in _export_list if not re.search(r"\b%s\b" % re.escape(
 check_true("docs/every exported name appears on a docs page",
            not _unreferenced, "named nowhere in docs/: %s" % _unreferenced)
 
+# checkpointsDir is the exception: the unit runs with DynamicUser and ProtectHome, so a null
+# default that fell through to $XDG_DATA_HOME would name a path nobody can populate and the
+# server would start with an empty store. Null points at the writable state directory instead.
+_t = option_text("checkpointsDir")
+check_true("nix/checkpointsDir is a nullOr option defaulting to null",
+           _t.count("nullOr") == 1 and re.search(r"^\s*default = null;", _t, re.M) is not None,
+           _t.strip()[:120])
+check_true("nix/checkpointsDir null falls back to a path under the state directory",
+           re.search(r'LAYA_CHECKPOINTS_DIR =\s*if cfg\.checkpointsDir != null then cfg\.checkpointsDir\s*'
+                     r'else "/var/lib/\$\{cfg\.stateDirectory\}/checkpoints";', nix_module) is not None,
+           "the unit would export no store, or one the sandbox hides")
+check_true("nix/checkpointsDir description warns about ProtectHome", "ProtectHome" in _t, _t.strip()[:120])
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
     print("  FAIL", f)

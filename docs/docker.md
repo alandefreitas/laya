@@ -335,7 +335,7 @@ These apply to the `laya-serve` service only.
 | `LAYA_PORT` | `8000` | container port, and the host port published for it |
 | `LAYA_BIND_ADDRESS` | `127.0.0.1` | host address the port is published on |
 | `LAYA_PRELOAD` | `0` | `1` builds every checkpoint at startup instead of on first request |
-| `LAYA_MODELS` | (all) | comma list to preload: `english,multilingual,typed-decisions` |
+| `LAYA_MODELS` | (all built-ins) | comma list to preload: `english,multilingual,typed-decisions` |
 | `LAYA_THREADS` | `OMP_NUM_THREADS` | caps torch intra-op threads; keep at or below physical cores |
 | `LAYA_AUTO_TASK` | `0` | `1` lets the router reach `typed-decisions` automatically |
 | `LAYA_DEFAULT_MODEL` | `english` | Checkpoint a state with no language evidence falls back to (no letters, or Latin text too short to identify). Set `multilingual` for mostly non-English traffic; an unresolvable name stops the container at startup instead of serving a configuration nobody asked for |

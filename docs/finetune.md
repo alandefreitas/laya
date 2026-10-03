@@ -127,6 +127,13 @@ agent = laya.load("your-org/your-checkpoint")   # the repo you just pushed
 result = agent.predict(state, questions)
 ```
 
+To serve it beside the built-in checkpoints, put the exported directory in the checkpoint store,
+`~/.local/share/laya/checkpoints/<name>/`, and write a `checkpoint.json` manifest beside the weights
+last (a manifest alone, with a `source` naming the pushed repo, works too; a directory without one is
+not registered). `laya-serve` picks it up at startup, or on `POST /reload`: `"model": "<name>"` selects it, and the manifest's question-id
+signatures route matching requests to it with no `model` at all. See
+[Serving your own checkpoints](http-api.md#serving-your-own-checkpoints).
+
 A rolling `checkpoint_latest/` is overwritten after every epoch, so a Kaggle timeout or OOM
 costs one epoch rather than the run.
 

@@ -10,7 +10,10 @@ and the MCP process itself stays at a few tens of megabytes, with no torch impor
 Routing stays local and free. ``RemoteRouter`` is a ``Router``, so ``route`` / ``route_batch``
 run the same language and script detection the server runs, without a model. The server makes
 its own routing decision for the actual answer and reports it in ``routing``; the two agree when
-the MCP process and the server see the same ``LAYA_DEFAULT_MODEL`` / ``LAYA_AUTO_TASK``.
+the MCP process and the server see the same ``LAYA_DEFAULT_MODEL`` / ``LAYA_AUTO_TASK``. The
+server's store checkpoints are the exception: their names and question-id signatures live only on
+the server, so ``route`` here never selects one by signature (it reports the built-in the
+question ids would otherwise reach), while ``predict`` still does, and ``routing`` says so.
 
 Not available remotely: ``load`` (and therefore ``laya_shortlist``, which needs the answering
 checkpoint's embeddings in-process), ``preload`` and ``unload`` (no-ops: the server owns its
@@ -29,7 +32,7 @@ import urllib.request
 import urllib.parse
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from ..router import Router
+from ..router import _NAME_RE, Router, canonical_name
 from ..serve import BODY_CONTROLS, BODY_REFUSALS
 
 DEFAULT_TIMEOUT_S = 300.0
@@ -77,6 +80,8 @@ class RemoteRouter(Router):
         parsed = urllib.parse.urlsplit(self.base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
             raise ValueError("base_url must be an HTTP(S) server URL without a query or fragment")
+        if self.default not in self.models:
+            self._add(self.default, None)   # a server checkpoint as the fallback: the server owns its source
         self.api_key = api_key or None
         self.timeout = _timeout_from_env() if timeout is None else float(timeout)
         if not math.isfinite(self.timeout) or self.timeout <= 0:
@@ -117,6 +122,48 @@ class RemoteRouter(Router):
         if not isinstance(payload, dict):
             raise RemoteError("upstream_error", "laya-serve returned a non-object body")
         return payload
+
+    # ------------------------------------------------------------------ registry (server-owned)
+    def resolve(self, name: Any) -> str:
+        """A built-in name as `Router` resolves it, or a checkpoint the server reports as registered.
+
+        The server holds the registry: a checkpoint in its store (`LAYA_CHECKPOINTS_DIR`) is unknown
+        to this process, so a name that is not a built-in is looked up in the server's `/health`
+        `registered` list. A name the server does not have is refused here, as a typo of a built-in
+        is locally, because laya-serve itself would auto-route it instead of rejecting it. Names the
+        server has reported are remembered, so each is checked once; a miss asks `/health` again. When
+        the server cannot be asked (unreachable, wrong bearer) the `RemoteError` propagates, so the
+        caller sees the connection or credential problem rather than "unknown model".
+        """
+        try:
+            return super().resolve(name)
+        except ValueError:
+            key = canonical_name(name)
+            if not _NAME_RE.match(key):
+                raise
+            if not hasattr(self, "base_url"):
+                return key       # no base_url yet: Router.__init__ resolving LAYA_DEFAULT_MODEL
+            known = self.__dict__.setdefault("_known_registered", set())
+            if key not in known:
+                payload = self.health()
+                if not isinstance(payload.get("registered"), dict):
+                    if "loaded" in payload:
+                        raise      # authorized, but a server from before the store: nothing is registered
+                    raise RemoteError("unauthorized", "laya-serve did not list its registered checkpoints; "
+                                      "check that LAYA_API_KEY matches the server's") from None
+                known.update(payload["registered"])
+            if key in known:
+                return key
+            raise
+
+    @property
+    def registered(self) -> Dict[str, Dict[str, Any]]:
+        """The server's registered checkpoints, from `/health`, or {} when it cannot be asked."""
+        try:
+            value = self.health().get("registered")
+        except RemoteError:
+            return {}
+        return dict(value) if isinstance(value, dict) else {}
 
     # ------------------------------------------------------------------ server state
     def health(self) -> Dict[str, Any]:

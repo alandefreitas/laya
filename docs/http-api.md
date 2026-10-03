@@ -30,10 +30,11 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 | `LAYA_ROOT_PATH` | public URL prefix when served behind a reverse proxy | empty |
 | `LAYA_DEVICE` | torch device for every checkpoint | auto |
 | `LAYA_PRELOAD` | build the checkpoints at startup, not lazily | `1` |
-| `LAYA_MODELS` | comma list to preload (`english,multilingual,typed-decisions`); empty = all | all |
+| `LAYA_MODELS` | comma list to preload (`english,multilingual,typed-decisions`, or a registered name); empty = every built-in | all built-ins |
 | `LAYA_THREADS` | cap torch intra-op threads on CPU; keep it <= physical cores -- oversubscribing logical cores is a large regression | torch default |
 | `LAYA_AUTO_TASK` | auto-route to the typed-decisions checkpoint | `0` |
 | `LAYA_IDLE_UNLOAD_SECONDS` | unload resident checkpoints after this many idle seconds; the next request loads its checkpoint again. Zero disables unloading | `0` |
+| `LAYA_CHECKPOINTS_DIR` | a store of your own checkpoints, one directory per checkpoint, each served beside the built-ins under its own name; see [Serving your own checkpoints](#serving-your-own-checkpoints) | `$XDG_DATA_HOME/laya/checkpoints` |
 | `LAYA_DEFAULT_MODEL` | checkpoint a state with no language evidence falls back to; aliases such as `ml` resolve the way core resolves them, and an unresolvable name stops the server at startup | `english` |
 | `LAYA_API_KEY` | if set, require `Authorization: Bearer <key>` | none |
 | `LAYA_LOG_LEVEL` | uvicorn log level | `info` |
@@ -54,6 +55,90 @@ failed requests. The next prediction pays a cold load. Unloading releases model 
 device caches, including Metal; the process allocator may retain RAM pages, so process RSS need
 not fall by the size of the checkpoint.
 
+## Serving your own checkpoints
+
+A fine-tune exported by the [training recipe](finetune.md) is a directory with `model.safetensors`,
+`rl_agent_config.json`, `encoder/` and `tokenizer/`. Put it in the checkpoint store and `laya-serve`
+serves it beside the built-ins under its own name. The store is `LAYA_CHECKPOINTS_DIR`, by default
+`$XDG_DATA_HOME/laya/checkpoints` (`~/.local/share/laya/checkpoints`), one directory per checkpoint:
+
+```
+~/.local/share/laya/checkpoints/
+    research/
+        checkpoint.json          the manifest (required; write it last)
+        model.safetensors
+        rl_agent_config.json
+        encoder/  tokenizer/
+```
+
+The manifest, `checkpoint.json`, is required and is the completion marker: a directory that holds
+weights but no manifest is not registered, because it may be an export still being written (write
+the manifest last, once the files are complete), and `/health` reports it under `registered_errors`.
+The checkpoint is served under its own name, so `"model": "research"` in a request selects it, and
+the manifest adds what a name alone cannot say:
+
+```json
+{
+  "name": "research",
+  "description": "Files claims from paper abstracts into a research brief's sections",
+  "signatures": [["section"], ["section", "subsection"]],
+  "base": "english",
+  "created": "2026-10-02",
+  "training": {"rows": 22436, "epochs": 2, "hours": 2.4}
+}
+```
+
+- `signatures` are the ways a request selects this checkpoint when it names no `model`. Each entry
+  is either a list of question ids or a mapping from question id to instructions. A list, such as
+  `["section"]`, matches a request whose question ids are exactly that set, the same exact match the
+  built-in typed-decisions workflows use. A mapping, such as
+  `{"section": "Which section of the brief does this claim belong to?"}`, matches the same id set and
+  also requires the request's question under each id to carry those instructions, compared with
+  whitespace collapsed; the value may be the text or its digest from `laya.router.instructions_digest`
+  (`sha1:...`), and `null` pins nothing for that id. The mapping form ties the checkpoint to the
+  questions it was trained on, so two workflows that both ask a `section` question with different
+  wording are told apart; the entry with the most pins is tried first, then id-only ones. Two entries
+  of different checkpoints on one id set that neither contain nor contradict each other's pins are refused. A digest must be
+  `sha1:` plus 40 hex digits. The object form `{"ids": [...], "instructions": {...}, "options": {...},
+  "for": "..."}` carries more facets, and every facet present must match: `ids` is required, and
+  `options` maps an id to the answer set the question must offer, either its sorted choice labels (a
+  `choice` question, whether it sends `criteria` as a label mapping or a plain list) or its number of
+  score levels (a `score` question). `for` is free text for the reader and takes no part in matching.
+  An object with an `ids` key that is not valid (an unknown key such as `purpose`, `ids` not a list)
+  is refused. `/health` reports each entry in that form, a plain id list when nothing but ids is
+  pinned, and that shape is accepted back. The model never sees a
+  question's id, only its instructions and options, so renaming ids does not invalidate a trained
+  checkpoint, and the instructions are what identifies a question kind. Several entries may name one
+  checkpoint, since a fine-tune usually covers a few related question formats; the same entry cannot
+  name two checkpoints; the checkpoint whose directory sorts second is skipped and reported. An explicit `model` or
+  `task` in the request still wins; language detection runs only for requests no signature claims.
+- `source` is optional: a Hub repo id (`"org/laya-research"`) or a `["org/repo", "subfolder"]` pair to
+  load instead of the directory, for a checkpoint you pushed rather than kept locally.
+- `name` defaults to the directory name, lowercased. A name that is a built-in or an alias (`english`, `ml`, `typed`, ...) is refused, so a directory cannot silently replace one. `description` is reported by `/health` and `laya_status`.
+  Everything else is yours; the server keeps it and reads none of it.
+
+A registered checkpoint is a checkpoint: `LAYA_MODELS` may preload it (the default preloads the built-ins only, so a large store loads on first use), `LAYA_DEFAULT_MODEL` may name
+it, `LAYA_MAX_LOADED` evicts it least-recently-used like the others, and `LAYA_IDLE_UNLOAD_SECONDS`
+unloads it after a quiet spell and reloads it on the next request that routes to it. Many small
+fine-tunes behind one server therefore cost memory only while someone is asking each of them.
+`/health` lists them under `registered`, and `routing.model` in every answer says which one answered.
+
+One bad checkpoint does not stop the server. A directory is skipped, and the built-ins and the other
+checkpoints keep serving, when it has no manifest, when its manifest cannot be read or is invalid,
+when it holds neither weights nor a `source`, when its name is taken (a built-in, an alias, `auto`,
+or another directory), or when a signature is already another checkpoint's. Each skipped directory is
+logged at startup and reported by `/health` under `registered_errors`, as directory name to reason. Only
+what makes the whole store unreadable (`LAYA_CHECKPOINTS_DIR` exists but cannot be listed), or a
+`LAYA_DEFAULT_MODEL` that names a skipped checkpoint, refuses startup, since both are explicit
+configuration. A README or any other directory with no weights and no manifest is ignored.
+
+A new fine-tune does not need a restart: `POST /reload` (below) rescans the store.
+
+The MCP server reads the same store in local mode, and in shared-server mode
+(`LAYA_BASE_URL`) a name the server lists under `registered` passes through to it; see
+[CLI and MCP](cli-mcp.md). In Python the same registry is `Router(models=..., signatures=...)` and
+`Router.register`; see [Routing](routing.md#your-own-checkpoints).
+
 ## Endpoints
 
 ### `GET /health`
@@ -70,7 +155,8 @@ no `LAYA_API_KEY` set, every caller gets the full payload shown here.
 {"status": "ok", "loaded": ["english", "multilingual"], "revisions": {"english": "...", "multilingual": "..."},
  "device": "cuda", "device_is_preference": false,
  "checkpoint_devices": {"english": "cuda", "multilingual": "cuda"},
- "cpu_fallbacks": {"english": {"count": 0, "last_reason": null}, "multilingual": {"count": 0, "last_reason": null}}}
+ "cpu_fallbacks": {"english": {"count": 0, "last_reason": null}, "multilingual": {"count": 0, "last_reason": null}},
+ "registered": {}, "registered_errors": {}, "version": "0.3.26"}
 ```
 
 One server's answer, so the blocks agree with each other: every key of `revisions`,
@@ -99,6 +185,22 @@ Health probes do not reset that clock. An empty `loaded` list is normal after an
   retried once on CPU: `count` since the process started, and `last_reason` carrying the error text
   of the latest one. The demotion is scoped to the request that failed, so a checkpoint built on CPU
   because the GPU was never available is not a fallback and counts `0` here -- that shows in `device`.
+- `registered` is the deployment's own checkpoints, the ones found in `LAYA_CHECKPOINTS_DIR` and served
+  beside the built-ins: name → `source` (the directory or Hub repo it loads from), `signatures` (the
+  question-id sets, or objects `{ids, instructions?, options?, for?}` adding pinned instruction digests, pinned `options` (sorted choice labels or a score level count) and the manifest's `for` purpose, that select it when a request names no `model`) and `description` from its
+  manifest. Empty on a stock server. A registered checkpoint appears in `loaded` only while it is
+  resident, like any other; see [Serving your own checkpoints](#serving-your-own-checkpoints).
+- `registered_errors` is the store directories that were skipped, at startup or by the last
+  `POST /reload`: directory name → why (no manifest, an invalid manifest, a taken name or signature).
+  A skipped directory can still be served from its previous manifest: when a reload refuses an edit
+  of a checkpoint that was already registered because its new signature is held by the default model
+  whose directory is no longer in the store or is itself skipped (or by a checkpoint registered
+  outside the store), the name
+  appears in both `registered` (the old registration) and `registered_errors`. When the default model is
+  an unchanged store checkpoint, the refused edit is unregistered like any skipped directory.
+  Empty when the store is clean.
+- `version` is the laya package version this server runs (`laya.__version__` of the code that is imported, not the installed metadata, which an editable install leaves stale),
+  so a client can tell which build answers.
 
 ### `POST /v1/systemone`
 
@@ -143,7 +245,12 @@ now get the same answer.
 (`convaiinnovations/laya-multilingual`, `convaiinnovations/laya-typed-decisions`), the checkpoint
 names (`english`, `multilingual`, `typed-decisions`) and their aliases select a checkpoint; any
 other value -- including a Jev id like `jev-1` -- means "let the router choose", and the response's
-`routing` block records what was chosen and why.
+`routing` block records what was chosen and why. A non-empty `model` that matches nothing is still not
+an error, but it is visible: `routing.reason` starts with `unknown model <name>; ` followed by the usual
+reason (on `/v1/systemone/batch` too, for every result), and the server log notes each distinct name
+once. The bundle repo id `convaiinnovations/laya` and `auto` mean "let the router choose" and are not
+reported. (With `LAYA_JEV_STRICT` the `routing` block is dropped, so there is nothing to prefix; the log
+line remains.)
 
 ### Response
 
@@ -229,6 +336,34 @@ caller sizing states by character count cannot see the cut anywhere else in the 
 the question ids. A `lang_guess` leaves no key of its own -- the hint it acted on is named in
 `reason`. The `model` and `task` branches report `workflow` as `null` too, because they answer
 before the question ids are read.
+
+### `POST /reload`
+
+Rescans `LAYA_CHECKPOINTS_DIR` without a restart, so a new fine-tune is served without dropping the
+resident checkpoints or the requests in flight. Same bearer rule as `/v1/systemone` (`401` without it
+when `LAYA_API_KEY` is set); the body is ignored.
+
+```bash
+curl -s -X POST localhost:8000/reload -H "authorization: Bearer $LAYA_API_KEY"
+```
+
+New checkpoints are registered, changed ones (source, signatures or description) are replaced, not
+appended to, and a checkpoint whose source changed is unloaded so the next request builds the new
+one. A checkpoint that left the store, or whose directory is now skipped, is unregistered and
+unloaded if resident, except the one `LAYA_DEFAULT_MODEL` names, which stays and is reported.
+A signature conflict with an unchanged checkpoint refuses the new or edited manifest, whatever the
+directory order, and never the unchanged checkpoint. A conflict between two new or edited manifests
+goes to the directory that sorts first. If the refused manifest is an edit of a checkpoint that was
+already registered, that checkpoint is skipped like any other bad directory: it is unregistered and
+unloaded, and `registered_errors` says why. Only a conflict with a holder outside this scan's
+results (the default model whose directory left the store or is itself skipped, or a checkpoint
+registered outside the store) keeps the previous registration (source, signatures, description),
+which is then reported in `registered_errors` as well. The
+built-ins are never touched. The answer is `registered` (the same map as `/health`),
+`registered_errors` (the skipped directories, the same shape as in `/health`) and the names
+`added`, `updated` and `removed`. A store directory that cannot be listed is a `500` and changes
+nothing. Reloads run on the inference worker, one at a time and in line with inference; a request
+that is already routed finishes against the checkpoint it chose.
 
 ### Confidence: two numbers, not interchangeable
 
@@ -317,7 +452,7 @@ requests in-process without the HTTP layer.
 | `401` | `LAYA_API_KEY` is set and the bearer token is missing or wrong | `invalid or missing bearer token` |
 | `413` | any limit above | which limit and by how much |
 | `422` | the question is well-formed JSON but invalid to Laya (unknown type, options over the head budget), or a request control (`lang`, `min_confidence`, a hook argument) is not in the form this endpoint accepts | names the question or the field and what to fix |
-| `500` | inference failed for any other reason | `inference failed` -- always this string, so paths, weights and memory state never leak; the cause is in the server log |
+| `500` | inference failed for any other reason (or, on `POST /reload`, the store directory could not be listed) | `inference failed` (on `POST /reload`: `cannot list the checkpoint store`) -- always these strings, so paths, weights and memory state never leak; the cause is in the server log |
 | `503` | `LAYA_MAX_CONCURRENT` requests are already in flight | `server busy, try again later` |
 
 The unpaired-surrogate `400` is the one that looks unusual. `\udXXX` with no pair is legal JSON, but

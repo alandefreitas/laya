@@ -124,6 +124,59 @@ question wording, and adding unrelated question IDs prevents an exact match.
 router = Router(auto_task_detection=True)
 ```
 
+## Your own checkpoints
+
+A router serves the checkpoints you register beside the built-in three. A registered checkpoint is a
+Hub repo id, a `(repo, subfolder)` pair, or a local directory exported by the
+[fine-tuning recipe](finetune.md); it is named in `model=` like a built-in, and loaded, evicted and
+unloaded like one.
+
+```python
+router = Router(
+    models={"research": "~/.local/share/laya/checkpoints/research"},
+    signatures={"research": [["section"], ["section", "subsection"]]},
+)
+
+router.predict(claim, {"section": section_question})          # -> research, by its signature
+router.predict(claim, {"section": section_question}, model="english")   # explicit model still wins
+router.predict(claim, {"q": other_question})                   # -> english or multilingual, by language
+
+router.register("tone", "acme/laya-tone", signatures=[["mood"]], description="Tone of a reply")
+router.resolve("Tone")     # 'tone'
+router.registered          # {'research': {...}, 'tone': {'source': 'acme/laya-tone', ...}}
+```
+
+`signatures` are the ways a request selects a checkpoint when it names no `model`. A set of
+question ids, such as `["section"]`, matches a request whose question ids are exactly that set, the
+same rule the typed-decisions workflows use. A mapping from question id to instructions, such as
+`{"section": "Which section of the brief does this claim belong to?"}`, matches the same id set and
+also requires the request's question under that id to carry those instructions (whitespace
+collapsed; the value may be the text, its `instructions_digest`, or `None` to pin nothing for that
+id). The mapping form is the one to use when several workflows ask questions under the same ids: the
+model never sees an id, only the instructions and options, so the instructions are what identifies
+the question kind a checkpoint was trained on. The faceted object `{"ids": [...], "instructions": {...}, "options": {...}, "for": "..."}` adds
+`options`, which maps an id to the sorted choice labels (a `choice` question, labels as a mapping or a
+list) or the number of score levels (a `score` question) the question must offer, and `for`, free
+text that takes no part in matching; every facet present must match, and a malformed object with an
+`ids` key is refused. The signature with the most pinned facets is tried first, then id-only ones;
+signatures of different checkpoints on one id set whose facets neither contain nor contradict each other are refused. A digest is `sha1:` plus 40 hex digits.
+Several signatures may select one checkpoint; the same signature cannot select two, and registering
+it twice raises. Registering a name that is already registered with `signatures=` replaces its
+signatures (the list given is the whole set), and leaving `signatures` out keeps them. `router.unregister("tone")`
+removes a registered checkpoint (source, signatures, description, pins), unloading it if resident;
+a built-in cannot be unregistered. Both are safe while requests are being routed. Registered signatures are checked before the built-in workflows and need no
+`auto_task_detection`, since registering one is the opt-in. In the precedence list above they sit at
+step 3, after an explicit `model=` or `task=` and before any language rule.
+
+`resolve()` is the instance form of the name normalisation: it accepts the built-in names, their
+aliases, and the names registered on this router, and raises `ValueError` for anything else. Every
+option that takes a checkpoint name goes through it, so `default`, `revisions`, `sha256_digests`,
+`preload()` and `unload()` accept a registered name too.
+
+`laya-serve` and `laya-mcp-server` build this registry from a directory of checkpoints, each with an
+required manifest (`checkpoint.json`) carrying its signatures; see
+[Serving your own checkpoints](http-api.md#serving-your-own-checkpoints).
+
 ## Inspect routing without loading models
 
 Use `route()` to inspect one decision or `route_batch()` to inspect a sequence. Neither method

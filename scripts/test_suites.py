@@ -74,6 +74,7 @@ SCRIPT_SUITES = [
     "tests/test_modelscope_prefetch.py",
     "tests/test_empty_questions.py",
     "tests/test_router_memory.py",
+    "tests/test_store.py",
     "tests/test_shortlist_cosine.py",
     "tests/test_temperature_loading.py",
     "tests/test_confidence.py",

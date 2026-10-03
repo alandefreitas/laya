@@ -231,6 +231,7 @@ the server is ready.
 | `LAYA_DEFAULT_MODEL` | `english` | The checkpoint a state with no language evidence falls back to, same meaning as in `laya.serve`. Unlike `laya.serve`, an unresolvable name does not stop the server: it comes back as a `router construction failed` tool error on the next call, because a stdio server has no startup to refuse. |
 | `LAYA_BASE_URL` | unset | Send predictions to a `laya-serve` on your own hardware instead of loading checkpoints in each MCP process. A bare `host:port` is read as HTTP. |
 | `LAYA_REMOTE_TIMEOUT` | `300` | HTTP timeout in seconds when `LAYA_BASE_URL` is set, including the server's cold load. Invalid or non-positive values use the default. |
+| `LAYA_CHECKPOINTS_DIR` | `$XDG_DATA_HOME/laya/checkpoints` | The same store of your own checkpoints `laya-serve` reads, one directory per checkpoint with a required `checkpoint.json` manifest (a directory without one is skipped); see [Serving your own checkpoints](http-api.md#serving-your-own-checkpoints). In local mode the MCP process registers them beside the built-ins, so `model: "<name>"` and the manifest's question-id signatures reach them from every tool. With `LAYA_BASE_URL` set, the server's store applies: a name that is not a built-in is accepted only when the server lists it under `registered` (otherwise `invalid_model`, as for a typo in local mode), and `laya_status` reports the server's `registered` list. |
 
 ### Share one model server across MCP sessions
 
@@ -256,7 +257,11 @@ prediction tools use HTTP to reach your server. `laya_predict`, `laya_predict_ba
 and `laya_preset` use the server's original state, instructions and option descriptions.
 Heterogeneous batches send one `/v1/systemone` request per item, preserving input order;
 `batch_size` and `sort_by_length` do not change the server's execution. `laya_status` reports the
-server's `/health`; `laya_route` and `laya_route_batch` stay local and need no model or HTTP request.
+server's `/health`; `laya_route` and `laya_route_batch` stay local and load no model (a `model=` or `task=` that
+names a store checkpoint is checked once against the server's `/health`),
+so they do not know the server's store checkpoints: a question-id signature that selects one on the
+server shows here as the built-in it would otherwise reach, while `laya_predict` reports the
+server's own `routing`. `LAYA_DEFAULT_MODEL` may name a store checkpoint on the server.
 The MCP process imports no torch and loads no checkpoint, including when `LAYA_THREADS` or
 `LAYA_PRELOAD` is set.
 

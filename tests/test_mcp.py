@@ -2509,6 +2509,38 @@ test_default_model_env()
 test_server_registration()
 test_server_shortlist_k_default()
 
+
+def test_registered_checkpoints_through_the_tools():
+    """A name registered on the router is a checkpoint to every tool, and status lists it."""
+    from laya.mcp.tools import validate_task
+    from laya.router import Router
+
+    router = Router(models={"research": "/tmp/laya-research"}, signatures={"research": [["section"]]})
+    ok("registry/validate_model resolves a registered name", validate_model("Research", router) == "research")
+    ok("registry/validate_model still resolves a built-in", validate_model("ml", router) == "multilingual")
+    expect_tool_error("registry/validate_model rejects an unknown name even with a router",
+                      lambda: validate_model("nope", router), "invalid_model")
+    expect_tool_error("registry/without a router the built-in table decides",
+                      lambda: validate_model("research"), "invalid_model")
+    ok("registry/validate_task accepts a registered name", validate_task("research", router) == "research")
+    expect_tool_error("registry/validate_task rejects an unknown name", lambda: validate_task("nope", router),
+                      "invalid_task")
+    q = {"section": {"type": "choice", "instructions": "Which section?", "criteria": {"a": "A", "b": "B"}}}
+    out = laya_route({"text": "A claim."}, q, router=router)
+    ok("registry/laya_route follows a registered signature", out["model"] == "research", repr(out))
+    out = laya_route({"text": "A claim."}, q, model="english", router=router)
+    ok("registry/laya_route lets model= win", out["model"] == "english", repr(out))
+    batch = laya_route_batch([{"state": {"text": "A claim."}, "questions": q, "model": "research"}], router=router)
+    ok("registry/laya_route_batch accepts a registered model per item",
+       batch["decisions"][0]["model"] == "research", repr(batch)[:200])
+    status = laya_status(router=router, preload=False)
+    ok("registry/laya_status lists registered checkpoints",
+       status["registered"] == {"research": {"source": "/tmp/laya-research", "signatures": [["section"]],
+                                             "description": None}}, repr(status.get("registered")))
+
+
+test_registered_checkpoints_through_the_tools()
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
     print("  FAIL", f)

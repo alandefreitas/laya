@@ -25,6 +25,7 @@ Environment (same meaning as laya.serve where it exists):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -142,6 +143,22 @@ def _remote_base_url() -> str | None:
     return raw.rstrip("/")
 
 
+def _remote_default_option() -> dict:
+    """``LAYA_DEFAULT_MODEL`` for a remote router: a well-formed name the server may know is kept.
+
+    The checkpoints in the server's store are unknown to this process, so a name that is neither a
+    built-in nor an alias passes through as the server's own, as ``RemoteRouter.resolve`` does.
+    """
+    try:
+        return _default_model_option()
+    except ValueError:
+        from laya.router import _NAME_RE, canonical_name
+        name = canonical_name(os.environ.get("LAYA_DEFAULT_MODEL", ""))
+        if _NAME_RE.match(name):
+            return {"default": name}
+        raise
+
+
 def _ensure_router() -> Any:
     """Build the Router from the environment, following the laya.serve contract.
 
@@ -169,7 +186,7 @@ def _ensure_router() -> Any:
                 from .remote import RemoteRouter
                 router = RemoteRouter(base_url, api_key=os.environ.get("LAYA_API_KEY") or None,
                                       auto_task_detection=_env_bool("LAYA_AUTO_TASK", False),
-                                      **_default_model_option())
+                                      **_remote_default_option())
             except Exception as exc:
                 raise ToolError("internal_error", f"remote router construction failed: {exc}") from exc
             _ROUTER = router
@@ -180,9 +197,19 @@ def _ensure_router() -> Any:
             raise ToolError("internal_error", f"cannot import laya: {exc}") from exc
         try:
             _apply_thread_limit()
+            # The same store laya-serve reads (`LAYA_CHECKPOINTS_DIR`): a fine-tune there is served
+            # under its own name here too, by `model=` or by its question-id signatures.
+            from laya.store import router_options, scan
+            store, store_errors = scan()
+            for entry, why in store_errors.items():     # a bad checkpoint is skipped, not fatal
+                logging.getLogger("laya.mcp").error("checkpoint store: skipped %s: %s", entry, why)
             router = Router(device=env_device(),
                             auto_task_detection=_env_bool("LAYA_AUTO_TASK", False),
-                            **_default_model_option())
+                            **router_options(store),
+                            **_default_model_option(store))
+            for checkpoint in store.values():
+                if checkpoint.description:
+                    router.descriptions[checkpoint.name] = checkpoint.description
             if _env_bool("LAYA_PRELOAD", True):
                 router.preload(_models_from_env())
         except Exception as exc:
